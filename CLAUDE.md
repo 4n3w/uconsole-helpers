@@ -713,7 +713,24 @@ last N entries to `bin/say`. Voice in, voice out.
 | `note add "text"` / `note add -` | append; `-` reads stdin, which is how dictation gets in |
 | `note today` / `note search TERM` | print today; ripgrep everything |
 | `note read [N]` | speak the last N entries aloud |
+| `note quick` | prompt for one typed line and save it — `$mod+Shift+n` |
 | `note edit` / `note sync` | `$EDITOR` on today's file; commit and push |
+
+**`$mod+Shift+n` captures with the keyboard**, for when no mic is attached — out with
+the device, or the USB sound card left on the desk. Every other capture path assumes a
+microphone, which made that the one situation where the notebook was simply unavailable.
+It opens a small floating `foot` running `note quick`, which uses `read -e` so readline
+editing works; on this keyboard, retyping a line because backspace did not work would be
+the whole cost of the feature.
+
+Two sway 1.5 traps in that one binding, both silent:
+
+- **A floating window is not a placed window.** Left alone, sway put a 620x180 window at
+  (714,678) on a 1280x720 output — off both the right and bottom edges.
+- **`move position center` returns `{"success": true}` and does nothing.** Same species as
+  `output power` versus `dpms`: accepted, ineffective, and only catchable by reading the
+  rect back with `swaymsg -t get_tree` afterwards. Explicit coordinates work, so the rule
+  hardcodes 330,270 — fine, since this file is specific to one panel anyway.
 
 **`daily/` is an immutable capture log. Nothing edits it.** Devices append; triage never
 rewrites. Three things follow, and all three were the reason to choose it:

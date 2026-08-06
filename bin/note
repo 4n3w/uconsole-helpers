@@ -5,6 +5,7 @@
 #   note                  pick and read a note (fzf, with preview)
 #   note add "text"       append an entry to today's log
 #   note add -            append from stdin — how dictation gets in
+#   note quick            prompt for one typed line and save it
 #   note inbox            how much is waiting to be triaged
 #   note triage           walk the untriaged entries, one at a time
 #   note today            print today's entries
@@ -187,6 +188,30 @@ do_add() {
     printf '  noted (%s)\n' "$(date +%H:%M)" >&2
 }
 
+# Typed capture, for when no mic is attached — out with the uConsole, or the USB
+# sound card left on the desk. Every other capture path assumes a microphone,
+# which made this the one situation where the notebook was simply unavailable.
+#
+# `read -e` turns on readline, so backspace, arrows and word-erase all work. That
+# matters more than it sounds on this keyboard: without it, a typo in a long line
+# means retyping the line.
+#
+# Prints and pauses briefly before exiting, because the window closes on exit and
+# a capture that vanishes without a word looks like it failed.
+do_quick() {
+    ensure_dir
+    printf '  note — Enter saves, Ctrl-C cancels\n\n' >&2
+    local line
+    IFS= read -r -e -p '  > ' line || { printf '\n  cancelled\n' >&2; exit 0; }
+    if [ -z "${line//[[:space:]]/}" ]; then
+        printf '  nothing captured\n' >&2
+        sleep 0.6
+        exit 0
+    fi
+    do_add --source typed "$line"
+    sleep 0.6
+}
+
 do_today() {
     local f; f=$(today_file)
     [ -f "$f" ] || { printf 'note: nothing today\n' >&2; exit 0; }
@@ -271,6 +296,7 @@ do_pick() {
 
 case "${1:-}" in
     add)    shift; do_add "$@" ;;
+    quick)  do_quick ;;
     inbox)  ensure_dir; python3 "$TRIAGE" "$DIR" inbox ;;
     triage) shift; ensure_dir; python3 "$TRIAGE" "$DIR" triage "$@" ;;
     dismiss-before) shift; ensure_dir; python3 "$TRIAGE" "$DIR" dismiss-before "${1:-}" \
