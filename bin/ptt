@@ -8,7 +8,11 @@
 #   ptt start [--enter] begin recording
 #   ptt stop            end, transcribe, type
 #   ptt cancel          throw the recording away without transcribing
+#
+# Recording also stops on its own after $PTT_SILENCE_SECS of quiet (default 3),
+# so in practice the second tap is only needed to cut yourself off early.
 #   ptt status          print whether a recording is live
+#   ptt level           live mic level, for checking the silence threshold
 #
 # Both bindings live in sway/10-uconsole.conf. See that file for why neither is
 # Fn+backslash, which is what you actually want and cannot have.
@@ -74,6 +78,20 @@ TRAILING_SPACE="${PTT_TRAILING_SPACE:-1}"
 # RMS below this means the capture device is not working. See the DEAD MIC
 # section below for why this number, and why it is not a speech detector.
 SILENCE_DBFS="${PTT_SILENCE_DBFS:--70}"
+
+### Auto-stop on trailing silence
+#
+# Seconds of quiet that end an utterance, so a dictation does not need a second
+# tap. 0 restores pure toggle behaviour. See bin/ptt-silence-watch.py for why the
+# threshold errs low, and why this is a different judgement from SILENCE_DBFS
+# above — that one refuses to transcribe at all and had to be near-unmissable,
+# because its false positive silently discards real dictation. This one is
+# always recoverable, because the manual toggle never goes away.
+SILENCE_SECS="${PTT_SILENCE_SECS:-3}"
+SILENCE_END_DBFS="${PTT_SILENCE_END_DBFS:--40}"
+
+SELF="$(readlink -f "$0")"
+WATCHER="$(dirname "$SELF")/ptt-silence-watch.py"
 
 mkdir -p "$RUN" "$CACHE"
 
@@ -264,7 +282,8 @@ do_start() {
     command -v arecord >/dev/null || { log "start: arecord missing"; beep error -bg; return 1; }
 
     # Old recordings from a crash or a missed stop. Cheap, and bounded.
-    find "$RUN" -maxdepth 1 -name 'rec-*.wav' -mmin +60 -delete 2>/dev/null
+    find "$RUN" -maxdepth 1 \( -name 'rec-*.wav' -o -name 'level-*.wav' \) \
+        -mmin +60 -delete 2>/dev/null
 
     beep start   # blocking on purpose — see the header
 
@@ -277,6 +296,13 @@ do_start() {
 
     printf '%s %s %s %s\n' "$pid" "$wav" "$started" "$enter" >"$STATE"
     log "start: pid=$pid wav=$wav enter=$enter"
+
+    # Detached, and it shuts itself down when the state file stops naming this
+    # recording — so nothing here has to track or kill it.
+    if [ "$SILENCE_SECS" != "0" ] && [ -x "$WATCHER" ]; then
+        setsid "$WATCHER" "$wav" "$STATE" "$SELF" \
+            "$SILENCE_SECS" "$SILENCE_END_DBFS" "$LOG" >/dev/null 2>&1 &
+    fi
 }
 
 do_stop() {
@@ -416,6 +442,43 @@ do_cancel() {
     beep error -bg
 }
 
+# Live level meter, so the auto-stop threshold can be set from your own room and
+# voice rather than from numbers measured in someone else's. Speak, then stop
+# speaking, and watch where the two populations sit: the threshold wants to be
+# between them, nearer the quiet one.
+# Cleanup lives at script scope, not inside do_level, so the trap can still see
+# these after the function's locals would have gone. The first attempt built the
+# trap by string-splicing the paths into it, which was unreadable and did not
+# work — three test runs left three recordings behind in $XDG_RUNTIME_DIR.
+LEVEL_WAV=""
+LEVEL_REC=""
+level_cleanup() {
+    [ -n "$LEVEL_REC" ] && kill "$LEVEL_REC" 2>/dev/null
+    [ -n "$LEVEL_WAV" ] && rm -f "$LEVEL_WAV"
+    return 0
+}
+
+# Live level meter, so the auto-stop threshold can be set from your own room and
+# voice rather than from numbers measured in someone else's. Speak, then stop
+# speaking, and watch where the two populations sit: the threshold wants to be
+# between them and nearer the quiet one, because reading speech as silence cuts
+# you off mid-sentence while reading silence as speech merely fails to auto-stop.
+#
+# Measured here with a loudspeaker standing in for a voice: speech -22 to -27
+# dBFS, room silence -42 to -48. A real voice at the mic is louder than that, so
+# treat those as a lower bound on the margin.
+do_level() {
+    command -v arecord >/dev/null || die "ptt: arecord not found"
+    LEVEL_WAV="$RUN/level-$(now_ms).wav"
+    trap level_cleanup INT TERM EXIT
+    printf '  threshold is %s dBFS over a %ss window. Ctrl-C to stop.\n\n' \
+        "$SILENCE_END_DBFS" "$SILENCE_SECS" >&2
+    arecord -q -f S16_LE -r 16000 -c 1 -d 600 "$LEVEL_WAV" >/dev/null 2>&1 &
+    LEVEL_REC=$!
+    python3 "$WATCHER" --trace "$LEVEL_WAV" "$SILENCE_SECS" "$SILENCE_END_DBFS"
+    level_cleanup
+}
+
 do_status() {
     local state pid wav started enter
     if state=$(read_state); then
@@ -433,6 +496,7 @@ case "${1:-}" in
     toggle) if read_state >/dev/null; then do_stop; else do_start "$(want_enter "${2:-}")"; fi ;;
     cancel) do_cancel ;;
     status) do_status ;;
+    level)  do_level ;;
     -h|--help|help|'') sed -n '3,11p' "$0" | sed 's/^# \?//' ;;
     *)      printf 'ptt: unknown command %s\n' "$1" >&2; exit 1 ;;
 esac

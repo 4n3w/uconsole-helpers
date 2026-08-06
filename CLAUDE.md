@@ -830,6 +830,37 @@ This mattered more under the old hold binding, where sway could drop a `--releas
 focus changed mid-hold, but it is still the right behaviour: ignoring the press instead
 would leave the key dead until `arecord` hits its own `-d` ceiling.
 
+**Recording auto-stops after 3 s of quiet**, so the second tap is only needed to cut
+yourself off early. `bin/ptt-silence-watch.py` is spawned detached by `start`, polls the
+growing wav, and runs `ptt stop` when it falls quiet. It exits on its own once the state
+file stops naming that recording, so a manual toggle, a cancel or an orphan recovery all
+end it without its pid being tracked. `PTT_SILENCE_SECS=0` restores pure toggling.
+
+It reads **raw bytes from a fixed 44-byte offset** rather than using python's `wave`
+module: arecord only finalises the header's frame count on close, so `wave` cannot read a
+file still being written.
+
+**It measures the loudest 0.5 s block in the window, NOT the window's mean**, and this
+was caught in testing rather than reasoned out. A 3 s window holding 0.9 s of speech and
+2.1 s of quiet *averaged* −40.3 dBFS and tripped a −40.0 threshold — ending the recording
+mid-sentence. Energy diluted across a window hides in the mean. The loudest block asks
+the right question, "was anything said at any point in the last N seconds", and the same
+test then passed with 4.1 dB of margin instead of 0.3.
+
+This is the mirror of the peak-versus-SNR lesson under `bin/audio level`: averaging hides
+brief loud events, peak hides brief quiet ones, and neither one is "the level".
+
+Measured here with a loudspeaker standing in for a voice — speech **−22 to −27 dBFS**,
+room silence **−42 to −48**, with transients around −37. The −40 default sits in that
+gap. **The threshold errs low deliberately**: too high and quiet speech reads as silence
+and cuts you off, too low and it simply never fires and you tap twice as before. One
+failure is disruptive, the other invisible.
+
+`ptt level` prints a live meter for setting it from your own room and voice, because a
+threshold measured in someone else's is worthless — and because loudspeaker playback
+turned out to be a poor stand-in for a voice at the mic, invalidating a test rather than
+the code.
+
 **Whisper's non-speech tags must be filtered before typing.** This is not theoretical:
 the very first test recorded three seconds of a quiet room and whisper returned
 `(dramatic music)`; the next returned `[BLANK_AUDIO]`. Printing that from `listen` is
