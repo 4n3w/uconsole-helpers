@@ -417,7 +417,7 @@ emit() {
     if [ "$sink" = "note" ]; then
         local n; n="$(dirname "$SELF")/note"
         if [ -x "$n" ]; then
-            printf '%s' "$1" | "$n" add - >>"$LOG" 2>&1 && return 0
+            printf '%s' "$1" | "$n" add --source voice - >>"$LOG" 2>&1 && return 0
             log "emit: note add failed"
         else
             log "emit: bin/note not found at $n"

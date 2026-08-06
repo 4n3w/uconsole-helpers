@@ -715,6 +715,50 @@ last N entries to `bin/say`. Voice in, voice out.
 | `note read [N]` | speak the last N entries aloud |
 | `note edit` / `note sync` | `$EDITOR` on today's file; commit and push |
 
+**`daily/` is an immutable capture log. Nothing edits it.** Devices append; triage never
+rewrites. Three things follow, and all three were the reason to choose it:
+
+- `merge=union` is *provably* safe there, because append-only from one writer cannot
+  produce a real conflict. Editing those files from a second machine WOULD silently
+  duplicate content under union, with no conflict marker to warn you. The rule is
+  therefore **scoped** to `daily/*.md`, not global — an earlier version applied it across
+  the whole vault, which is actively dangerous for notes you author.
+- The log stays a faithful record of what was actually said, transcription errors
+  included, which is worth more than it sounds when an entry is ambiguous weeks later.
+- "Fix the typo" becomes "promote it into a real note", which is where the corrected
+  version belonged anyway.
+
+**Triage state is per entry, not a watermark**, and that is the load-bearing choice.
+A watermark forces you to process *in order*; come back from two weeks away and it
+demands 200 entries before it will move, which is how an inbox becomes permanent guilt.
+`.triage/done.tsv` records entries individually, so you can skip freely and leave the
+rest indefinitely. `note dismiss-before DATE` writes off a fortnight in one command
+rather than an act of will. Nothing expires on its own and nothing is deleted —
+dismissing marks an entry handled, it does not touch the log.
+
+That state file is append-only too, so it takes `merge=union` as well and triaging from
+two machines merges cleanly. Duplicate lines are harmless; it is read as a set.
+
+**Entry IDs are `DATE T TIME`, with an occurrence suffix on repeats.** Timestamps gained
+seconds because two captures a minute apart both landed on `## 10:08` in testing, which
+the index could not tell apart — but the parser disambiguates anyway, since legacy
+entries predate the fix and two captures could in principle share a second. Fixed in the
+reader rather than by rewriting the log, because `daily/` is immutable and a parser can
+be corrected forever.
+
+**Provenance, not just "voice".** Entries carry `#voice` or `#typed`, and `note add
+--source X` sets it. What matters is not that something was spoken but how likely it is
+to be wrong: speech gives homophones and run-ons, handwriting OCR gives character errors
+and lost layout, typing gives neither. This is the seam a Supernote bridge would plug
+into — a cloud-folder watcher on another machine dropping `--source ink` entries into the
+same inbox. Not built.
+
+**Deliberately not built around Obsidian.** A vault is just a folder of markdown, so
+Obsidian can read this if wanted, but nothing requires it — the frontmatter and tags are
+inert if unused. Triage is a terminal flow because that is where this user actually
+works; designing the workflow around an app they had tried once and not enjoyed would
+have produced a system that got set up and never opened.
+
 **One file per day, appended**, because the hard part of filing a note by voice is
 *naming* it and a daily file needs no name. Deriving a filename from the first few
 transcribed words sounds clever and yields `2026-08-06-1032-the-thing-about-the.md`.

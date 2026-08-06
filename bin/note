@@ -3,13 +3,15 @@
 # note — a spoken notebook. Capture by voice, retrieve by voice.
 #
 #   note                  pick and read a note (fzf, with preview)
-#   note add "text"       append an entry to today's file
+#   note add "text"       append an entry to today's log
 #   note add -            append from stdin — how dictation gets in
+#   note inbox            how much is waiting to be triaged
+#   note triage           walk the untriaged entries, one at a time
 #   note today            print today's entries
-#   note search TERM      search every note
+#   note search TERM      search everything
 #   note read [N]         speak the last N entries aloud (default 1)
-#   note edit             open today's file in $EDITOR
-#   note sync             commit and push
+#   note edit             open today's log in $EDITOR
+#   note sync             pull, then push
 #
 # Bound to $mod+n in sway/10-uconsole.conf, which dictates straight into it.
 #
@@ -24,6 +26,23 @@
 # And retrieval can be spoken. On a 5" panel, reading back a week of notes is
 # unpleasant; `note read` hands them to bin/say instead. Voice in, voice out —
 # the thing this device does that a laptop does not.
+#
+# daily/ IS AN IMMUTABLE LOG. NOTHING EDITS IT.
+#
+# Devices append; triage never rewrites. Three things fall out of that, and all
+# three were the reason to choose it:
+#
+#   * `merge=union` is provably safe on those files, because append-only from
+#     one writer at a time cannot produce a real conflict. Editing them from a
+#     second machine WOULD silently duplicate content under union, with no
+#     conflict marker to warn you.
+#   * The log stays a faithful record of what was actually said, transcription
+#     errors included — which is worth more than it sounds when a garbled entry
+#     is ambiguous three weeks later.
+#   * "Fix the typo" becomes "promote it into a real note", which is where you
+#     wanted the corrected version anyway.
+#
+# So notes you author live at the vault root; daily/ is only ever the inbox.
 #
 # ONE FILE PER DAY, APPENDED
 #
@@ -46,6 +65,7 @@ set -uo pipefail
 
 DIR="${NOTE_DIR:-$HOME/notes}"
 SAY="${NOTE_SAY:-$(dirname "$(readlink -f "$0")")/say}"
+TRIAGE="$(dirname "$(readlink -f "$0")")/note-triage.py"
 
 die() { printf 'note: %s\n' "$*" >&2; exit 1; }
 
@@ -55,12 +75,23 @@ die() { printf 'note: %s\n' "$*" >&2; exit 1; }
 # entries may interleave oddly but nothing is lost and nothing needs resolving.
 write_gitattributes() {
     local ga="$DIR/.gitattributes"
-    grep -qs 'merge=union' "$ga" 2>/dev/null && return 0
-    printf '# Daily notes are append-only; keep both sides rather than conflicting.\n' >>"$ga"
-    printf '*.md merge=union\n' >>"$ga"
+    grep -qs 'daily/\*.md merge=union' "$ga" 2>/dev/null && return 0
+    # SCOPED, not global. An earlier version set `*.md merge=union` across the
+    # whole vault, which is actively dangerous for notes you AUTHOR: union keeps
+    # both sides' lines, so two machines editing the same real note produce
+    # duplicated prose with no conflict to alert you. Union is only correct where
+    # writes are strictly appends.
+    {
+        printf '# Appended-to, never edited: keep both sides rather than conflicting.\n'
+        printf 'daily/*.md merge=union\n'
+        printf '.triage/done.tsv merge=union\n'
+    } >>"$ga"
+    # Drop the old global rule if it is still there.
+    grep -v '^\*\.md merge=union$' "$ga" >"$ga.tmp" 2>/dev/null && mv "$ga.tmp" "$ga"
 }
 
-today_file() { printf '%s/%s.md' "$DIR" "$(date +%F)"; }
+DAILY="$DIR/daily"
+today_file() { printf '%s/%s.md' "$DAILY" "$(date +%F)"; }
 
 ensure_dir() {
     mkdir -p "$DIR" || die "cannot create $DIR"
@@ -118,7 +149,10 @@ autopush() {
 }
 
 do_add() {
-    local text
+    local text source="typed"
+    while [ "${1:-}" = "--source" ]; do
+        source="${2:-typed}"; shift 2
+    done
     if [ "${1:-}" = "-" ]; then
         text=$(cat)
     elif [ $# -gt 0 ]; then
@@ -130,9 +164,24 @@ do_add() {
     [ -n "${text//[[:space:]]/}" ] || { printf 'note: nothing to add\n' >&2; exit 0; }
 
     ensure_dir
+    mkdir -p "$DAILY"
     local f; f=$(today_file)
-    [ -f "$f" ] || printf '# %s\n' "$(date '+%A %-d %B %Y')" >"$f"
-    printf '\n## %s\n\n%s\n' "$(date +%H:%M)" "$text" >>"$f"
+    if [ ! -f "$f" ]; then
+        # Frontmatter must be the FIRST thing in the file, so it is written at
+        # creation and never appended. Costs nothing if you never use a reader
+        # that understands it.
+        {
+            printf -- '---\n'
+            printf 'date: %s\n' "$(date +%F)"
+            printf 'type: capture-log\n'
+            printf -- '---\n\n'
+            printf '# %s\n' "$(date '+%A %-d %B %Y')"
+        } >"$f"
+    fi
+    # SECONDS, not just HH:MM. Entry IDs must be unique for per-entry triage
+    # state, and testing produced two entries stamped `## 10:08` within a minute
+    # of each other — which the triage index could not have told apart.
+    printf '\n## %s #%s\n\n%s\n' "$(date +%H:%M:%S)" "$source" "$text" >>"$f"
     commit_quietly
     autopush
     printf '  noted (%s)\n' "$(date +%H:%M)" >&2
@@ -215,12 +264,16 @@ do_pick() {
 
 case "${1:-}" in
     add)    shift; do_add "$@" ;;
+    inbox)  ensure_dir; python3 "$TRIAGE" "$DIR" inbox ;;
+    triage) shift; ensure_dir; python3 "$TRIAGE" "$DIR" triage "$@" ;;
+    dismiss-before) shift; ensure_dir; python3 "$TRIAGE" "$DIR" dismiss-before "${1:-}" \
+                    && commit_quietly && autopush ;;
     today)  do_today ;;
     search) shift; do_search "$@" ;;
     read)   shift; do_read "${1:-1}" ;;
     edit)   do_edit ;;
     sync)   do_sync ;;
     '')     do_pick ;;
-    -h|--help|help) sed -n '3,13p' "$0" | sed 's/^# \?//' ;;
+    -h|--help|help) sed -n '3,15p' "$0" | sed 's/^# \?//' ;;
     *)      die "unknown command '$1' (try --help)" ;;
 esac
