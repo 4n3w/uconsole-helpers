@@ -151,7 +151,13 @@ def promote(dir_, entry):
     if not title:
         print("    (no title — skipped)")
         return False
-    path = os.path.join(dir_, slugify(title) + ".md")
+    # topics/, not the vault root. daily/ answers "when", topics/ answers "what",
+    # and the root stays for vault-level files. Flat inside — no folder taxonomy,
+    # because categorising up front is how these systems stall. Links and tags do
+    # the organising, and this is one `git mv` from any other choice.
+    topics = os.path.join(dir_, "topics")
+    os.makedirs(topics, exist_ok=True)
+    path = os.path.join(topics, slugify(title) + ".md")
     new = not os.path.exists(path)
     with open(path, "a", encoding="utf-8") as fh:
         if new:

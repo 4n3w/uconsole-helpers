@@ -746,6 +746,25 @@ entries predate the fix and two captures could in principle share a second. Fixe
 reader rather than by rewriting the log, because `daily/` is immutable and a parser can
 be corrected forever.
 
+The vault has three parts, and the split is `when` / `what` / `everything else`:
+
+```
+~/notes/
+  daily/     immutable capture log — devices append, nothing edits
+  topics/    notes triage promoted — flat, no folder taxonomy
+  .triage/   per-entry state, append-only
+```
+
+`topics/` is flat on purpose. Categorising up front is how these systems stall; links and
+tags do the organising, and the whole thing is one `git mv` from any other layout.
+
+**Should the note tooling live here at all?** By this repo's own charter, no — it claims
+to own only what "would be wrong or useless on any other machine", and `bin/note` would
+run fine on a laptop. It stays for now because the tool is three files and unproven, and
+because `dotfiles` has no `bin/` convention to move it into. The signal to extract it is
+triaging routinely from another machine; until then the cheap route is cloning this repo
+there and symlinking two files.
+
 **Provenance, not just "voice".** Entries carry `#voice` or `#typed`, and `note add
 --source X` sets it. What matters is not that something was spoken but how likely it is
 to be wrong: speech gives homophones and run-ons, handwriting OCR gives character errors
