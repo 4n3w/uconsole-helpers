@@ -724,8 +724,28 @@ not — the same split as `bin/wifi`, which starts and stops daemons but never r
 passphrase. `~/notes` is its own private git repo, initialised on first use, and
 `$NOTE_DIR` overrides the location.
 
-**Capture commits but never pushes.** Wifi is off by default here, so a binding that
-blocked on a DNS timeout would feel broken. `note sync` pushes deliberately.
+**Capture commits synchronously and pushes in the background.** The first version
+committed only, on the reasoning that a keybinding must never block on the network with
+wifi off — correct as far as it went, and it missed the point: the whole reason for
+git-backing notes is SD card failure, and an unpushed commit dies with the card exactly
+as an uncommitted file would. Local commits protected against nothing that mattered.
+
+The push is now detached, `timeout`-limited to 45 s, and guarded by an atomic `mkdir`
+lock so a burst of notes cannot start a pile of concurrent pushes racing for the same
+ref. Measured: capture returns in **~0.12 s** whether the remote is reachable or not, and
+with a deliberately unreachable remote the note still lands locally and the failure goes
+to `$XDG_RUNTIME_DIR/note-push.log` rather than to your face. Pushes are cumulative, so a
+missed one costs nothing — the next note carries everything forward.
+`NOTE_AUTOPUSH=0` disables it.
+
+The log lives in `$XDG_RUNTIME_DIR`, **not** in the notes directory, because anything
+there is swept up by `git add -A` and committed.
+
+**`note sync` pulls before pushing**, with `--no-rebase` on purpose: the `merge=union`
+driver set in `.gitattributes` only applies to merges. Union keeps *both* sides' lines
+rather than raising a conflict, which for append-only timestamped day-files is very
+nearly right — entries from two machines may interleave oddly, but nothing is lost and
+nothing needs hand-resolving.
 
 `~/notes` has a **private remote of its own**, added by hand:
 

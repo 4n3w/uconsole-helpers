@@ -49,6 +49,17 @@ SAY="${NOTE_SAY:-$(dirname "$(readlink -f "$0")")/say}"
 
 die() { printf 'note: %s\n' "$*" >&2; exit 1; }
 
+# Daily files are append-only from possibly more than one machine, so a plain
+# merge would conflict on any day both touched. `merge=union` is built into git
+# and keeps BOTH sides' lines, which for a timestamped log is close to ideal —
+# entries may interleave oddly but nothing is lost and nothing needs resolving.
+write_gitattributes() {
+    local ga="$DIR/.gitattributes"
+    grep -qs 'merge=union' "$ga" 2>/dev/null && return 0
+    printf '# Daily notes are append-only; keep both sides rather than conflicting.\n' >>"$ga"
+    printf '*.md merge=union\n' >>"$ga"
+}
+
 today_file() { printf '%s/%s.md' "$DIR" "$(date +%F)"; }
 
 ensure_dir() {
@@ -57,23 +68,53 @@ ensure_dir() {
     # history for only after losing some, and this box keeps teaching that the
     # SD card is the single point of failure. Init on first use rather than
     # asking.
+    [ -d "$DIR/.git" ] && write_gitattributes
     if [ ! -d "$DIR/.git" ]; then
         git -C "$DIR" init -q 2>/dev/null || return 0
         printf '# notes\n\nPrivate. Captured by `note`, mostly by voice.\n' >"$DIR/README.md"
+        write_gitattributes
         git -C "$DIR" add -A 2>/dev/null
         git -C "$DIR" commit -qm "Initial commit" 2>/dev/null
         printf '  initialised a git repo in %s\n' "$DIR" >&2
     fi
 }
 
-# Commit, never push. Capture must not touch the network: wifi is off by default
-# on this box, and a binding that blocks on a DNS timeout would feel broken.
-# `note sync` pushes deliberately.
+# Commit synchronously, push in the BACKGROUND. Capture must never block on the
+# network — wifi is off by default here, and a keybinding that stalls on a DNS
+# timeout feels broken — but committing locally protects against nothing that
+# matters. The whole reason for git-backing these is SD card failure, and an
+# unpushed commit dies with the card exactly as an uncommitted file would.
+#
+# So the push is detached, time-limited and lock-guarded. If there is no network
+# it fails in a few seconds into a log nobody has to read, and the next note or
+# `note sync` carries everything forward — pushes are cumulative, so a missed one
+# costs nothing.
 commit_quietly() {
     [ -d "$DIR/.git" ] || return 0
     git -C "$DIR" add -A >/dev/null 2>&1
     git -C "$DIR" diff --cached --quiet 2>/dev/null && return 0
     git -C "$DIR" commit -qm "note: $(date '+%F %H:%M')" >/dev/null 2>&1
+}
+
+PUSHLOG="${XDG_RUNTIME_DIR:-/tmp}/note-push.log"
+
+# NOT inside $DIR: anything there gets swept up by `git add -A` and committed.
+autopush() {
+    [ "${NOTE_AUTOPUSH:-1}" = "1" ] || return 0
+    [ -d "$DIR/.git" ] || return 0
+    git -C "$DIR" remote 2>/dev/null | grep -q . || return 0
+    # mkdir is the atomic lock here — a burst of notes must not start a pile of
+    # concurrent pushes racing each other to the same ref.
+    (
+        mkdir "$DIR/.git/note-push.lock" 2>/dev/null || exit 0
+        trap 'rmdir "$DIR/.git/note-push.lock" 2>/dev/null' EXIT INT TERM
+        if timeout 45 git -C "$DIR" push >>"$PUSHLOG" 2>&1; then
+            printf '%s pushed\n' "$(date "+%F %T")" >>"$PUSHLOG"
+        else
+            printf '%s push failed — next note or `note sync` will carry it\n' \
+                "$(date "+%F %T")" >>"$PUSHLOG"
+        fi
+    ) </dev/null >/dev/null 2>&1 &
 }
 
 do_add() {
@@ -93,6 +134,7 @@ do_add() {
     [ -f "$f" ] || printf '# %s\n' "$(date '+%A %-d %B %Y')" >"$f"
     printf '\n## %s\n\n%s\n' "$(date +%H:%M)" "$text" >>"$f"
     commit_quietly
+    autopush
     printf '  noted (%s)\n' "$(date +%H:%M)" >&2
 }
 
@@ -145,11 +187,18 @@ do_edit() {
     commit_quietly
 }
 
+# Pull then push. Merge rather than rebase, deliberately: the union merge driver
+# set up in ensure_dir only applies to merges, and for append-only daily files
+# union is very nearly the right answer — it keeps both sides' lines instead of
+# raising a conflict over two machines appending to the same day.
 do_sync() {
     [ -d "$DIR/.git" ] || die "$DIR is not a git repo"
     commit_quietly
     git -C "$DIR" remote | grep -q . || die "no remote configured; add one with:
   git -C $DIR remote add origin <url>"
+    printf '  pulling...\n' >&2
+    git -C "$DIR" pull --no-rebase --no-edit 2>&1 | tail -4
+    printf '  pushing...\n' >&2
     git -C "$DIR" push 2>&1 | tail -3
 }
 
