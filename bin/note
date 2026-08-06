@@ -215,7 +215,7 @@ do_read() {
     local text files=""
     while IFS= read -r f; do
         [ -f "$f" ] && files="$files$f\n"
-    done < <(ls -1 "$DIR"/*.md 2>/dev/null | grep -v README | tail -3)
+    done < <(ls -1 "$DAILY"/*.md 2>/dev/null | tail -3)
     [ -n "$files" ] || { printf 'note: nothing to read\n' >&2; exit 0; }
     text=$(printf '%b' "$files" | while IFS= read -r f; do [ -n "$f" ] && cat "$f"; done \
         | awk -v n="$n" '
@@ -253,11 +253,18 @@ do_sync() {
 
 # Default view: pick an entry, print it. Preview needs the file, so the picker
 # lists files and previews their content.
+# Lists the whole vault — the daily log AND the notes triage produced. Both
+# matter: one is what you said, the other is what you decided it meant.
+#
+# Globbing only "$DIR"/*.md was right until the log moved into daily/, at which
+# point the picker silently stopped showing captures and `note read` found
+# nothing at all. Neither errored; they just quietly covered less ground.
 do_pick() {
     [ -d "$DIR" ] || die "no notes yet"
     command -v fzf >/dev/null || { do_today; return; }
     local f
-    f=$(ls -1t "$DIR"/*.md 2>/dev/null | grep -v README \
+    f=$(find "$DIR" -name '*.md' -not -path '*/.*' -newermt '1970-01-01' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | cut -d' ' -f2- | grep -v '/README.md$' \
         | fzf --prompt='note> ' --preview 'cat {}' --preview-window=right:60%) || return 0
     [ -n "$f" ] && cat "$f"
 }
