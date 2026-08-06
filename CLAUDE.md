@@ -112,6 +112,7 @@ All confirmed on-device 2026-07-27 unless noted.
 | GPU | `vc4-kms-v3d-pi4`, `cma-384` — **full KMS**, so wlroots works |
 | DRM | `card1`, `renderD128`; connector `DSI-1` connected |
 | Panel | native mode **`720x1280`** — portrait, because it is mounted rotated |
+| External | `HDMI-A-1` works — an iPad panel on a 12V driver board, 2048x1536. Note sway lays outputs side by side, so with it attached **`DSI-1` starts at x=2048, not 0**; absolute coordinates in sway commands land on whichever output spans them |
 | Overlays | `devterm-panel-uc`, `devterm-pmu`, `devterm-misc`, `audremap` |
 | Trackball | `7855:36:ClockworkPI_uConsole_Mouse`, `/dev/input/event6` — matched by `type:pointer`, confirmed. Three buttons: left, right, and **left+right together = a real `BTN_MIDDLE`** |
 | Keyboard | `1EAF:0024` (LeafLabs Maple MCU), `/dev/input/event4` |
@@ -723,16 +724,23 @@ It opens a small floating `foot` running `note quick`, which uses `read -e` so r
 editing works; on this keyboard, retyping a line because backspace did not work would be
 the whole cost of the feature.
 
-Two sway 1.5 traps in that one binding, both silent:
+**A correction worth keeping, because the wrong version was committed first.** The
+floating prompt appeared at (714,678) and I called it a placement bug, "fixed" it with
+hardcoded coordinates, and documented `move position center` as another sway 1.5 command
+that returns `{"success": true}` and does nothing. All of that was wrong.
 
-- **A floating window is not a placed window.** Left alone, sway put a 620x180 window at
-  (714,678) on a 1280x720 output — off both the right and bottom edges.
-- **`move position center` returns `{"success": true}` and does nothing.** Same species as
-  `output power` versus `dpms`: accepted, ineffective, and only catchable by reading the
-  rect back with `swaymsg -t get_tree` afterwards. Explicit coordinates work, so the rule
-  hardcodes 330,270 — fine, since this file is specific to one panel anyway.
+With the external display attached the outputs are `HDMI-A-1` 2048x1536 at (0,0) and
+`DSI-1` 1280x720 at **(2048,0)**. Centring a 620x180 window on the focused 2048x1536
+output gives exactly (714,678). Sway had placed it correctly; `move position center` was
+a legitimate no-op; and the hardcoded "fix" put the window somewhere centred on nothing.
 
-**`daily/` is an immutable capture log. Nothing edits it.** Devices append; triage never
+Two things to take from it. **Multi-output coordinates are absolute** and outputs are laid
+out side by side, so a hardcoded position lands on whichever output spans it — and on this
+box the built-in panel starts at x=2048, not 0. And **check `swaymsg -t get_outputs`
+before reasoning about any rect**: the geometry looked broken only because it was measured
+against a 1280x720 display that was not the one in use.
+
+**`daily/` is an immutable capture log.**`daily/` is an immutable capture log. Nothing edits it.** Devices append; triage never
 rewrites. Three things follow, and all three were the reason to choose it:
 
 - `merge=union` is *provably* safe there, because append-only from one writer cannot
