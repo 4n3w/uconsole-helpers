@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# say — speak text aloud through piper.
+#
+#   say "some text"          speak the arguments
+#   echo text | say          speak stdin
+#   say -v VOICE "text"      use a specific voice
+#   say -l                   list installed voices
+#   say -w FILE "text"       write a WAV instead of playing
+#   say --stop               shut up immediately
+#
+# Exists so Claude Code (or any script) can talk out loud on this box: it is a
+# single command with no arguments to remember, and it reads stdin, so anything
+# that produces text can be piped into it.
+#
+# WHY PIPER, AND WHY IT IS NOT AN APT PACKAGE
+#
+# bullseye packages espeak-ng/festival/flite, all of which sound like 1998. piper
+# is neural TTS, runs comfortably on the CM4, and sounds like something you would
+# actually leave switched on. It is not packaged for bullseye, so it is installed
+# by hand into ~/.local/share/piper — UNMANAGED by dpkg, exactly like the
+# JetBrainsMono Nerd Font. A fresh image loses it; see CLAUDE.md.
+#
+# The release tarball bundles its own libespeak-ng and libonnxruntime, so nothing
+# is needed from apt and there is no system-wide dependency to conflict with.
+#
+# AUDIO OUT ONLY, BY NECESSITY
+#
+# This board can speak but cannot listen: Raspberry Pi has no analog audio input
+# of any kind, and `arecord -l` lists no capture device at all. The 3.5mm jack is
+# output-only. Voice INPUT requires a USB or Bluetooth microphone; there is no
+# overlay or config that unlocks one.
+
+set -uo pipefail
+
+PIPER_DIR="${PIPER_DIR:-$HOME/.local/share/piper}"
+PIPER="$PIPER_DIR/piper"
+VOICES="$PIPER_DIR/voices"
+# Override persistently by exporting SAY_VOICE in ~/.profile.
+DEFAULT_VOICE="${SAY_VOICE:-en_GB-alba-medium}"
+
+RUN="${XDG_RUNTIME_DIR:-/tmp}/say"
+PGIDFILE="$RUN/speaking.pgid"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# --stop needs to reach BOTH piper and aplay. Killing aplay alone leaves piper
+# writing into a broken pipe, where it only dies once it next writes — which for
+# a long utterance is not "immediately". So playback runs under setsid in its own
+# process group and the whole group is signalled at once.
+#
+# Never pkill by name here. `aplay` is also how bin/ptt plays its beeps, and a
+# pattern kill would take those down too; the same reasoning as bin/wifi refusing
+# to pkill wpa_supplicant. Match the recorded group, nothing else.
+stop_speaking() {
+    [ -f "$PGIDFILE" ] || return 0
+    local pg=""
+    read -r pg <"$PGIDFILE" 2>/dev/null || true
+    rm -f "$PGIDFILE"
+    [ -n "$pg" ] || return 0
+    # Negative pid signals the group. Fall back to the bare pid in case setsid
+    # did not make it a group leader.
+    kill -TERM "-$pg" 2>/dev/null || kill -TERM "$pg" 2>/dev/null || true
+    return 0
+}
+
+list_voices() {
+    local found=0
+    for f in "$VOICES"/*.onnx; do
+        [ -e "$f" ] || continue
+        found=1
+        local n; n=$(basename "$f" .onnx)
+        printf '  %s%s\n' "$n" "$([ "$n" = "$DEFAULT_VOICE" ] && echo '  (default)')"
+    done
+    [ "$found" = 1 ] || printf '  no voices in %s\n' "$VOICES"
+}
+
+voice="$DEFAULT_VOICE"
+outfile=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -v|--voice)  voice="${2:-}"; shift 2 || die "say: -v needs a voice name" ;;
+        -w|--wav)    outfile="${2:-}"; shift 2 || die "say: -w needs a path" ;;
+        -l|--list)   list_voices; exit 0 ;;
+        --stop)      stop_speaking; exit 0 ;;
+        -h|--help)   sed -n '3,10p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        --)          shift; break ;;
+        -*)          die "say: unknown option '$1'" ;;
+        *)           break ;;
+    esac
+done
+
+[ -x "$PIPER" ] || die "say: piper not found at $PIPER"
+model="$VOICES/$voice.onnx"
+[ -f "$model" ] || { printf 'say: no such voice: %s\n\navailable:\n' "$voice" >&2; list_voices >&2; exit 1; }
+# piper reads the matching .json for sample rate and phoneme config; without it
+# the model cannot be loaded at all, so fail clearly rather than let piper abort.
+[ -f "$model.json" ] || die "say: $voice is missing its .onnx.json config"
+
+# Text from arguments, or stdin when there are none. Reading stdin means the
+# common shape — `something | say` — works without quoting anything.
+if [ $# -gt 0 ]; then
+    text="$*"
+else
+    [ -t 0 ] && die "say: no text given (pass arguments or pipe stdin)"
+    text=$(cat)
+fi
+[ -n "${text//[[:space:]]/}" ] || exit 0    # nothing to say is not an error
+
+# piper needs its bundled libs on the loader path; it does not rpath them.
+export LD_LIBRARY_PATH="$PIPER_DIR:${LD_LIBRARY_PATH:-}"
+# And it looks for phoneme data relative to a path it is told about.
+espeak_data="$PIPER_DIR/espeak-ng-data"
+
+if [ -n "$outfile" ]; then
+    printf '%s' "$text" | "$PIPER" -q --model "$model" --espeak_data "$espeak_data" \
+        --output_file "$outfile" 2>/dev/null || die "say: piper failed"
+    exit 0
+fi
+
+command -v aplay >/dev/null 2>&1 || die "say: aplay not found (install alsa-utils)"
+
+# A new utterance replaces the previous one rather than talking over it. Two
+# voices at once is unintelligible, and with a Stop hook firing per response it
+# would otherwise happen routinely.
+stop_speaking
+mkdir -p "$RUN"
+
+# --output_file - streams raw WAV on stdout, so nothing hits the disk AND audio
+# starts after roughly one sentence of synthesis rather than after all of it.
+# That is what makes speaking a long paragraph tolerable.
+#
+# setsid puts the pipeline in its own process group; see stop_speaking above.
+setsid bash -c '
+    printf "%s" "$1" \
+        | "$2" -q --model "$3" --espeak_data "$4" --output_file - 2>/dev/null \
+        | aplay -q - 2>/dev/null
+' _ "$text" "$PIPER" "$model" "$espeak_data" &
+pg=$!
+printf '%s\n' "$pg" >"$PGIDFILE"
+wait "$pg" 2>/dev/null
+rm -f "$PGIDFILE"

@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+#
+# audio — pick and check the uConsole's audio devices.
+#
+#   audio            fzf menu
+#   audio status     devices, volumes, mute state, which is default
+#   audio out        choose the output device
+#   audio in         choose the input device
+#   audio vol N      set output volume: 60, +10, -10
+#   audio mute       toggle output mute
+#   audio mic        toggle microphone mute
+#   audio test       speak a test phrase through the current output
+#   audio level      5s microphone level check
+#
+# WHY THIS EXISTS
+#
+# There are three independent places audio can be silenced on this box, and
+# checking one tells you nothing about the other two:
+#
+#   1. the uConsole's own MUTE BUTTON, which is physical and invisible to
+#      software entirely — it silences the internal speaker only
+#   2. the ALSA hardware mixer            (amixer -c N)
+#   3. PulseAudio's own software volume   (pactl), which is what applications
+#      actually pass through
+#
+# `audio status` shows 2 and 3 together so they cannot disagree unnoticed. If
+# everything here reads correct and there is still no sound, it is 1 — or you
+# are wearing a headset while the output is routed at the internal speaker.
+#
+# Bullseye ships pactl 14.2, which predates `pactl get-sink-volume` and friends.
+# Those subcommands fail with no useful message, so this parses `pactl list`
+# instead. Do not "modernise" it without checking the installed pactl.
+
+set -uo pipefail
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+command -v pactl >/dev/null || die "audio: pactl not found"
+
+default_sink()   { pactl info 2>/dev/null | sed -n 's/^Default Sink: //p'; }
+default_source() { pactl info 2>/dev/null | sed -n 's/^Default Source: //p'; }
+
+# Volume as a percentage for one sink/source, from `pactl list`.
+vol_of() {  # vol_of <sinks|sources> <name>
+    pactl list "$1" 2>/dev/null | awk -v want="$2" '
+        /^\t*Name: /      { cur = $2 }
+        /^\t*Mute: /      { if (cur == want) mute = $2 }
+        /^\t*Volume: /    { if (cur == want && !done) {
+                              match($0, /[0-9]+%/); v = substr($0, RSTART, RLENGTH); done = 1 } }
+        END { printf "%s %s", (v ? v : "?"), (mute ? mute : "?") }'
+}
+
+describe() {  # describe <sinks|sources> -> "name<TAB>description"
+    pactl list "$1" 2>/dev/null | awk '
+        /^\t*Name: /        { name = $2 }
+        /^\t*Description: / { $1 = ""; sub(/^ /, ""); if (name != "") { print name "\t" $0; name = "" } }'
+}
+
+do_status() {
+    local ds dsrc
+    ds=$(default_sink); dsrc=$(default_source)
+    printf 'OUTPUT\n'
+    describe sinks | while IFS=$'\t' read -r n d; do
+        read -r v m <<<"$(vol_of sinks "$n")"
+        printf '  %s %-42s vol=%-5s mute=%s\n' "$([ "$n" = "$ds" ] && echo '*' || echo ' ')" "$d" "$v" "$m"
+    done
+    printf '\nINPUT\n'
+    describe sources | grep -v '\.monitor' | while IFS=$'\t' read -r n d; do
+        read -r v m <<<"$(vol_of sources "$n")"
+        printf '  %s %-42s vol=%-5s mute=%s\n' "$([ "$n" = "$dsrc" ] && echo '*' || echo ' ')" "$d" "$v" "$m"
+    done
+    printf '\n  (* = default)   ALSA hardware mixers:\n'
+    for c in $(awk -F'[][]' '/^ *[0-9]+ \[/{print $2}' /proc/asound/cards 2>/dev/null | tr -d ' '); do
+        local idx; idx=$(awk -v c="$c" -F'[][]' '$2 ~ c {print $1+0; exit}' /proc/asound/cards 2>/dev/null)
+        [ -n "$idx" ] || continue
+        amixer -c "$idx" 2>/dev/null | awk -v card="$c" '
+            # Line looks like:  Simple mixer control ${q}Auto Gain Control${q},0
+            # Take what is between the FIRST pair of quotes; a greedy match here
+            # swallows the name and leaves ",0".
+            /^Simple mixer control/ { if (match($0, /'"'"'[^'"'"']*'"'"'/))
+                                        ctl = substr($0, RSTART+1, RLENGTH-2) }
+            /Mono:|Front Left:/ { if (match($0, /\[[0-9]+%\]/))
+                printf "    %-10s %-20s %-7s %s\n", card, ctl, substr($0,RSTART,RLENGTH),
+                       ($0 ~ /\[off\]/ ? "[MUTED]" : "") }'
+    done
+}
+
+pick() {  # pick <sinks|sources> <prompt> -> prints chosen name
+    command -v fzf >/dev/null || die "audio: fzf is not installed"
+    describe "$1" | { [ "$1" = sources ] && grep -v '\.monitor' || cat; } \
+        | awk -F'\t' '{printf "%s\t%s\n", $2, $1}' \
+        | fzf --height=40% --layout=reverse --border --with-nth=1 --delimiter='\t' \
+              --prompt="$2> " \
+        | cut -f2
+}
+
+do_out() {
+    local n; n=$(pick sinks "output") || return 0
+    [ -n "$n" ] || return 0
+    pactl set-default-sink "$n" || die "audio: could not set default sink"
+    # Changing the default does NOT move streams that are already playing, so
+    # anything currently making noise would carry on out of the old device.
+    pactl list short sink-inputs 2>/dev/null | cut -f1 | while read -r i; do
+        [ -n "$i" ] && pactl move-sink-input "$i" "$n" 2>/dev/null
+    done
+    printf 'output -> %s\n\n' "$n"; do_status
+}
+
+do_in() {
+    local n; n=$(pick sources "input") || return 0
+    [ -n "$n" ] || return 0
+    pactl set-default-source "$n" || die "audio: could not set default source"
+    pactl list short source-outputs 2>/dev/null | cut -f1 | while read -r i; do
+        [ -n "$i" ] && pactl move-source-output "$i" "$n" 2>/dev/null
+    done
+    printf 'input -> %s\n\n' "$n"; do_status
+}
+
+do_vol() {
+    local v="${1:-}"
+    [ -n "$v" ] || die "usage: audio vol N   (60, +10, -10)"
+    case "$v" in
+        +*|-*) pactl set-sink-volume "$(default_sink)" "${v}%" ;;
+        *)     pactl set-sink-volume "$(default_sink)" "${v}%" ;;
+    esac || die "audio: could not set volume"
+    read -r vv mm <<<"$(vol_of sinks "$(default_sink)")"
+    printf 'volume=%s mute=%s\n' "$vv" "$mm"
+}
+
+do_mute() {
+    pactl set-sink-mute "$(default_sink)" toggle || die "audio: could not toggle mute"
+    read -r vv mm <<<"$(vol_of sinks "$(default_sink)")"
+    printf 'output mute=%s\n' "$mm"
+}
+
+do_mic() {
+    pactl set-source-mute "$(default_source)" toggle || die "audio: could not toggle mic"
+    read -r vv mm <<<"$(vol_of sources "$(default_source)")"
+    printf 'mic mute=%s\n' "$mm"
+}
+
+do_test() {
+    if command -v say >/dev/null 2>&1; then
+        say "Audio test. If you can hear this, the current output device is working."
+    else
+        local f=/usr/share/sounds/alsa/Front_Center.wav
+        [ -f "$f" ] || die "audio: no test sound available and say is not installed"
+        aplay -q "$f"
+    fi
+    printf 'played through: %s\n' "$(default_sink)"
+}
+
+# Measures SIGNAL-TO-NOISE, not absolute level.
+#
+# Absolute level is the wrong metric and actively misleads: turning on the USB
+# card's Auto Gain Control lifted the measured "speech" peak from -25 to -18 dBFS
+# while lifting the NOISE FLOOR by the same 10 dB. That looks like an improvement
+# and is not one — whisper transcribed the result as "[bell ringing]", because a
+# loud recording of mostly noise is still mostly noise.
+#
+# So: record the room in silence, then record speech, and report the difference.
+do_level() {
+    local q s; q=$(mktemp /tmp/audio-q-XXXXXX.wav); s=$(mktemp /tmp/audio-s-XXXXXX.wav)
+    printf '\n  Stay QUIET for 3 seconds (measuring the noise floor)...\n'
+    arecord -f S16_LE -r 16000 -c 1 -d 3 "$q" 2>/dev/null
+    printf '  Now TALK for 4 seconds — hold the mic close to your mouth...\n\n'
+    arecord -f S16_LE -r 16000 -c 1 -d 4 "$s" 2>/dev/null
+    python3 - "$q" "$s" <<'PYA'
+import wave, struct, math, sys
+def stats(p):
+    w = wave.open(p); n = w.getnframes()
+    d = struct.unpack(f'<{n}h', w.readframes(n))
+    return max(abs(x) for x in d), math.sqrt(sum(x*x for x in d)/len(d))
+db = lambda v: 20*math.log10(v/32767) if v else -99.0
+(qp, qr), (sp, sr) = stats(sys.argv[1]), stats(sys.argv[2])
+snr = db(sr) - db(qr)
+print(f'  noise floor : peak {db(qp):6.1f} dBFS   rms {db(qr):6.1f} dBFS')
+print(f'  speech      : peak {db(sp):6.1f} dBFS   rms {db(sr):6.1f} dBFS')
+print(f'  SNR         : {snr:.1f} dB')
+if   snr >= 20: print('\n  GOOD — whisper should transcribe this reliably\n')
+elif snr >= 12: print('\n  MARGINAL — expect mistakes. Get the mic closer to your mouth.\n')
+else:           print('\n  TOO NOISY — whisper will return "[bell ringing]" or similar.\n'
+                      '  Move the mic to your mouth; make sure Auto Gain Control is OFF:\n'
+                      '      amixer -c 3 sset \'Auto Gain Control\' off\n')
+PYA
+    rm -f "$q" "$s"
+}
+
+menu() {
+    command -v fzf >/dev/null || die "audio: fzf is not installed"
+    printf '%s\n' \
+        "status   devices, volumes, mute state" \
+        "out      choose the output device" \
+        "in       choose the input device" \
+        "test     speak a test phrase through the current output" \
+        "level    5s microphone level check" \
+        "mute     toggle output mute" \
+        "mic      toggle microphone mute" |
+        fzf --height=60% --layout=reverse --border --prompt='audio> ' | awk '{print $1}'
+}
+
+cmd="${1:-}"
+[ -z "$cmd" ] && cmd=$(menu)
+[ -z "$cmd" ] && exit 0
+
+case "$cmd" in
+    status) do_status ;;
+    out)    do_out ;;
+    in)     do_in ;;
+    vol)    do_vol "${2:-}" ;;
+    mute)   do_mute ;;
+    mic)    do_mic ;;
+    test)   do_test ;;
+    level)  do_level ;;
+    *)      die "usage: audio [status|out|in|vol N|mute|mic|test|level]" ;;
+esac

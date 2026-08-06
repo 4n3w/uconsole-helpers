@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+#
+# ptt — push-to-talk dictation. Hold a key, speak, release; the text types
+# itself into whatever window has focus.
+#
+#   ptt start     begin recording          (bound to the key PRESS)
+#   ptt stop      end, transcribe, type    (bound to the key RELEASE)
+#   ptt toggle    press-once/press-again, for testing or a non-hold binding
+#   ptt cancel    throw the recording away without transcribing
+#   ptt status    print whether a recording is live
+#
+# Bound in sway/10-uconsole.conf as $mod+backslash. See that file for why it is
+# NOT Fn+backslash, which is what you actually want and cannot have.
+#
+# HOW THE TWO HALVES FIND EACH OTHER
+#
+# sway fires `exec` for the press and `exec` for the release as two completely
+# separate, detached processes. They share nothing — no pipe, no parent, no
+# stdin. So `start` leaves a state file behind and `stop` picks it up. That is
+# the whole architecture, and it is why this could not just be `bin/listen`.
+#
+# The state file holds pid, wav path and start time on one line. `stop` reads it
+# and DELETES IT IMMEDIATELY, before doing any of the slow work, so that a new
+# recording can begin while the previous one is still transcribing. The wav path
+# is unique per recording for the same reason — a fixed path would be clobbered
+# mid-transcription by the next key press.
+#
+# WHY THE BEEP COMES BEFORE THE RECORDING, NOT DURING IT
+#
+# Whisper reports honestly on non-speech audio: a recording that is mostly noise
+# comes back as `[bell ringing]` or `[beeping]` rather than words (see CLAUDE.md).
+# A start tone bleeding into the front of the recording is exactly the input that
+# provokes that. So the tone plays to completion first and recording starts after
+# — which also makes it mean the right thing: the beep is "go ahead", not
+# "recording started, you already missed the first syllable".
+#
+# The stop and error tones are backgrounded, because by then nothing is listening
+# and the latency would be pure cost.
+#
+# SAFETY: arecord is started with a hard -d limit. sway can miss a --release
+# binding (change focus mid-hold and the release never arrives), and without the
+# limit a missed release means arecord fills the SD card overnight.
+
+set -uo pipefail
+
+RUN="${XDG_RUNTIME_DIR:-/tmp}/ptt"
+STATE="$RUN/recording"
+LOG="$RUN/ptt.log"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/ptt"
+
+# Hard ceiling on a single recording, in seconds. Also the backstop for a missed
+# key release; see SAFETY above.
+MAX_SECONDS="${PTT_MAX_SECONDS:-120}"
+
+# Anything shorter than this is a fumbled keypress, not an utterance. Whisper on
+# a 100 ms clip returns confident nonsense, so discard rather than transcribe.
+MIN_MS="${PTT_MIN_MS:-350}"
+
+# Typed after the transcript, so consecutive utterances do not run together.
+# Set PTT_TRAILING_SPACE=0 for exactly the recognised text and nothing else.
+TRAILING_SPACE="${PTT_TRAILING_SPACE:-1}"
+
+# RMS below this means the capture device is not working. See the DEAD MIC
+# section below for why this number, and why it is not a speech detector.
+SILENCE_DBFS="${PTT_SILENCE_DBFS:--70}"
+
+mkdir -p "$RUN" "$CACHE"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+# Keep the log from growing without bound — this runs on every utterance.
+[ -f "$LOG" ] && [ "$(stat -c%s "$LOG" 2>/dev/null || echo 0)" -gt 262144 ] \
+    && tail -n 200 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+
+now_ms() { date +%s%3N; }
+
+### Tones
+#
+# Generated once into ~/.cache/ptt rather than committed as binary blobs, and
+# regenerated automatically if the cache is cleared. sox is not packaged usefully
+# here, so python3's `wave` does it — it is in the base install on bullseye.
+#
+# The 8 ms fade at each end matters: a raw sine that starts and stops at full
+# amplitude produces a click through the speaker, which sounds like a fault.
+
+gen_tone() {  # freq_hz  duration_ms  outfile
+    python3 - "$1" "$2" "$3" <<'PY' 2>/dev/null
+import math, struct, sys, wave
+freq, ms, out = float(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+rate = 16000
+n    = int(rate * ms / 1000)
+fade = int(rate * 0.008)
+buf  = bytearray()
+for i in range(n):
+    amp = 0.28
+    if i < fade:      amp *= i / fade
+    if i > n - fade:  amp *= (n - i) / fade
+    buf += struct.pack('<h', int(32767 * amp * math.sin(2 * math.pi * freq * i / rate)))
+w = wave.open(out, 'wb')
+w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
+w.writeframes(bytes(buf)); w.close()
+PY
+}
+
+tone_file() {  # name -> path, generating it if absent
+    local name="$1" f="$CACHE/$1.wav"
+    if [ ! -s "$f" ]; then
+        case "$name" in
+            start) gen_tone 880 100 "$f" ;;   # rising, bright: go ahead
+            stop)  gen_tone 660  80 "$f" ;;   # lower, shorter: heard you, working
+            error) gen_tone 220 200 "$f" ;;   # low and long: nothing usable
+        esac
+    fi
+    [ -s "$f" ] && printf '%s' "$f"
+}
+
+beep() {  # name [-bg]
+    local f; f=$(tone_file "$1") || return 0
+    [ -n "$f" ] || return 0
+    command -v aplay >/dev/null || return 0
+    if [ "${2:-}" = "-bg" ]; then
+        aplay -q "$f" >/dev/null 2>&1 &
+    else
+        aplay -q "$f" >/dev/null 2>&1
+    fi
+}
+
+### Dead mic detection
+#
+# THIS IS NOT A SPEECH DETECTOR, and must not be made into one. It answers one
+# question only: is the capture device producing anything at all?
+#
+# Measured on this board with the RØDE VideoMic GO II:
+#
+#     quiet room, mic working     rms  -43.1 dBFS
+#     dead / muted / unplugged    peak -84 to -90 dBFS
+#
+# That ~40 dB gulf is why the check is safe. The default -70 dBFS sits ~27 dB
+# below the working-room floor and ~15 dB above a dead one, so neither a quiet
+# room nor a quiet speaker can trip it.
+#
+# Separating "quiet room" from "someone talking" (~-25 dBFS) would be a far
+# narrower margin, and a threshold set slightly wrong would silently eat real
+# dictation. That is a much worse failure than the one being prevented, so this
+# deliberately does not attempt it.
+#
+# WHAT IT ACTUALLY BUYS. Whisper hallucinates on silence — 1.8 s of room noise
+# once came back as `$10,000.`, which is indistinguishable from speech and so
+# cannot be caught by the output-side filter in clean_text(). On this box the mic
+# can stop working in three documented ways, all of which look fine in every
+# mixer reading: the physical MUTE BUTTON, PulseAudio not auto-switching when a
+# USB device appears or vanishes, and the mic simply being knocked out. In each
+# case you dictate a whole paragraph and get one hallucinated sentence typed in,
+# with no indication why. This turns that into the error beep you already know.
+#
+# RMS, never peak. A single transient makes peak useless — the quiet room above
+# measured -5.5 dBFS peak against -43.1 rms. Same lesson as `bin/audio level`.
+#
+# FAILS OPEN. If python is missing or the wav is an unexpected format this prints
+# nothing and the recording is transcribed as normal. A broken helper must never
+# be able to block dictation.
+#
+# Long recordings are decimated 16:1 before the sum of squares — a 40 dB
+# judgement needs no precision, and `array` keeps the decode in C. `array('h')`
+# is native-endian and wav is little-endian, which agree on this board.
+wav_rms_dbfs() {
+    python3 - "$1" <<'PY' 2>/dev/null
+import array, math, sys, wave
+try:
+    w = wave.open(sys.argv[1])
+    if w.getsampwidth() != 2:
+        sys.exit(0)                      # not S16_LE — say nothing, fail open
+    a = array.array('h')
+    a.frombytes(w.readframes(w.getnframes()))
+    if not len(a):
+        sys.exit(0)
+    s = a[::16] if len(a) > 32000 else a
+    acc = 0
+    for v in s:
+        acc += v * v
+    rms = math.sqrt(acc / len(s))
+    print('%.1f' % (20 * math.log10(rms / 32768.0) if rms > 0 else -99.0))
+except Exception:
+    pass
+PY
+}
+
+### State
+
+# Prints "pid wav started_ms" if a recording is genuinely live, else nothing.
+# Checks /proc rather than `kill -0` so a stale file from a crashed arecord is
+# treated as absent rather than as a live recording that can never be stopped.
+read_state() {
+    [ -f "$STATE" ] || return 1
+    local pid wav started
+    read -r pid wav started <"$STATE" || return 1
+    [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] || return 1
+    printf '%s %s %s' "$pid" "$wav" "$started"
+}
+
+# A state file naming a process that no longer exists means the recording ended
+# on its own: arecord hit its -d ceiling because no stop ever came. That is the
+# benign outcome of a forgotten toggle — nothing is transcribed and nothing is
+# typed — but the wav is left behind, and at MAX_SECONDS it is several MB. Reap
+# it now rather than waiting for the hourly prune in do_start.
+reap_stale() {
+    [ -f "$STATE" ] || return 0
+    local pid wav started
+    read -r pid wav started <"$STATE" 2>/dev/null || { rm -f "$STATE"; return 0; }
+    [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] && return 0   # still live, leave alone
+    [ -n "${wav:-}" ] && rm -f "$wav"
+    rm -f "$STATE"
+    log "reaped abandoned recording — arecord hit its ${MAX_SECONDS}s ceiling"
+}
+
+### Actions
+
+do_start() {
+    reap_stale
+
+    # A live recording here means the previous key release never arrived — sway
+    # can drop a --release binding if focus changes mid-hold. Recover by
+    # discarding the orphan and starting fresh, silently.
+    #
+    # The tempting alternative, ignoring the press, is much worse: it leaves the
+    # key dead until arecord hits its own -d ceiling, so one missed release
+    # breaks dictation for MAX_SECONDS with no indication why.
+    local orphan opid owav ostarted
+    if orphan=$(read_state); then
+        read -r opid owav ostarted <<<"$orphan"
+        rm -f "$STATE"
+        kill "$opid" 2>/dev/null
+        wait "$opid" 2>/dev/null
+        rm -f "$owav"
+        log "start: recovered orphaned recording (pid $opid) — release was missed"
+    fi
+
+    command -v arecord >/dev/null || { log "start: arecord missing"; beep error -bg; return 1; }
+
+    # Old recordings from a crash or a missed stop. Cheap, and bounded.
+    find "$RUN" -maxdepth 1 -name 'rec-*.wav' -mmin +60 -delete 2>/dev/null
+
+    beep start   # blocking on purpose — see the header
+
+    local wav="$RUN/rec-$(now_ms).wav" started
+    started=$(now_ms)
+
+    # 16 kHz mono S16_LE is not a preference: whisper.cpp accepts nothing else.
+    arecord -q -f S16_LE -r 16000 -c 1 -d "$MAX_SECONDS" "$wav" >/dev/null 2>&1 &
+    local pid=$!
+
+    printf '%s %s %s\n' "$pid" "$wav" "$started" >"$STATE"
+    log "start: pid=$pid wav=$wav"
+}
+
+do_stop() {
+    reap_stale
+    local state pid wav started
+    state=$(read_state) || { log "stop: nothing recording"; rm -f "$STATE"; return 0; }
+    read -r pid wav started <<<"$state"
+
+    # Clear the slot BEFORE the slow work, so the next press is free to start.
+    rm -f "$STATE"
+
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+
+    local elapsed=$(( $(now_ms) - started ))
+    if [ "$elapsed" -lt "$MIN_MS" ]; then
+        log "stop: ${elapsed}ms is below MIN_MS=$MIN_MS, discarded"
+        rm -f "$wav"
+        beep error -bg
+        return 0
+    fi
+
+    if [ ! -s "$wav" ]; then
+        log "stop: nothing captured (is the mic still plugged in?)"
+        rm -f "$wav"
+        beep error -bg
+        return 1
+    fi
+
+    # Dead mic. Checked before the stop tone, so the only thing you hear is the
+    # error — nothing was captured, and there is no point pretending otherwise.
+    local level; level=$(wav_rms_dbfs "$wav")
+    if [ -n "${level:-}" ] && awk "BEGIN{exit !($level < $SILENCE_DBFS)}" 2>/dev/null; then
+        log "stop: MIC APPEARS DEAD — ${level} dBFS rms, below ${SILENCE_DBFS}. Check the physical mute button, and \`audio in\`."
+        rm -f "$wav"
+        beep error -bg
+        return 1
+    fi
+
+    beep stop -bg
+    log "stop: ${elapsed}ms captured, transcribing"
+
+    local text
+    text=$("$(dirname "$(readlink -f "$0")")/listen" -f "$wav" 2>>"$LOG")
+    rm -f "$wav"
+
+    if [ -z "${text:-}" ]; then
+        log "stop: no speech recognised"
+        beep error -bg
+        return 1
+    fi
+
+    local cleaned; cleaned=$(clean_text "$text")
+    if ! printf '%s' "$cleaned" | grep -q '[[:alnum:]]'; then
+        log "stop: non-speech only, nothing typed -- whisper said: $text"
+        beep error -bg
+        return 1
+    fi
+
+    log "stop: -> $cleaned"
+    emit "$cleaned"
+}
+
+# Strip whisper's non-speech annotations.
+#
+# THIS IS NOT COSMETIC. Whisper reports honestly on audio it cannot find speech
+# in, and it does so in words: three seconds of a quiet room came back from
+# tiny.en as `(dramatic music)` during the very first test of this script.
+# `[BLANK_AUDIO]`, `[ Silence ]`, `(beeping)` and `(bell ringing)` are all in the
+# same family — CLAUDE.md notes them as the signature of a poor SNR.
+#
+# When `listen` is run by hand that output is useful: you can see it heard
+# nothing. Typing it into the focused window is another matter entirely, so the
+# filter lives here rather than in `listen`.
+#
+# Tags are removed rather than the whole transcript being rejected, so a real
+# utterance with one cough in it still comes through. If nothing with a letter or
+# digit in it survives, there was no speech.
+clean_text() {
+    printf '%s' "$1" \
+        | sed -E 's/\([^)]*\)//g; s/\[[^]]*\]//g; s/\*[^*]*\*//g' \
+        | sed -E 's/[[:space:]]+/ /g; s/^ +//; s/ +$//'
+}
+
+# Type the transcript into the focused window, falling back to the clipboard.
+#
+# wtype drives the virtual-keyboard protocol, which sway 1.5 does implement
+# (wlr_virtual_keyboard_manager_v1 is in the binary). Its one documented
+# limitation is XWayland: X caps the number of keycode-keysym pairs, so typing
+# into an XWayland client fails. Native Wayland clients — foot, and therefore
+# anything in a terminal — are fine.
+#
+# `--` is mandatory, not defensive: a transcript beginning with a dash would
+# otherwise be parsed as wtype options.
+emit() {
+    local text="$1"
+    [ "$TRAILING_SPACE" = 1 ] && text="$text "
+
+    if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        # Run by hand from a TTY or over SSH. Just print it.
+        printf '%s\n' "$1"
+        return 0
+    fi
+
+    if command -v wtype >/dev/null; then
+        wtype -- "$text" 2>>"$LOG" && return 0
+        log "emit: wtype failed, falling back to clipboard"
+    fi
+
+    if command -v wl-copy >/dev/null; then
+        printf '%s' "$1" | wl-copy
+        log "emit: copied to clipboard instead"
+        return 0
+    fi
+
+    printf '%s\n' "$1"
+}
+
+do_cancel() {
+    reap_stale
+    local state pid wav started
+    state=$(read_state) || { rm -f "$STATE"; return 0; }
+    read -r pid wav started <<<"$state"
+    rm -f "$STATE"
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    rm -f "$wav"
+    log "cancel: discarded"
+    beep error -bg
+}
+
+do_status() {
+    local state pid wav started
+    if state=$(read_state); then
+        read -r pid wav started <<<"$state"
+        printf 'recording  %ss elapsed  (pid %s)\n' \
+            "$(( ( $(now_ms) - started ) / 1000 ))" "$pid"
+    else
+        printf 'idle\n'
+    fi
+}
+
+case "${1:-}" in
+    start)  do_start ;;
+    stop)   do_stop ;;
+    toggle) if read_state >/dev/null; then do_stop; else do_start; fi ;;
+    cancel) do_cancel ;;
+    status) do_status ;;
+    -h|--help|help|'') sed -n '3,12p' "$0" | sed 's/^# \?//' ;;
+    *)      printf 'ptt: unknown command %s\n' "$1" >&2; exit 1 ;;
+esac

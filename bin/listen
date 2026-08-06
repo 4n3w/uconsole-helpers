@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+#
+# listen — record speech and transcribe it with whisper.cpp.
+#
+#   listen              record until you press Enter, then print the transcript
+#   listen -d 8         record a fixed 8 seconds instead
+#   listen -f rec.wav   transcribe an existing file, recording nothing
+#   listen -m tiny.en   pick a model (default: base.en-q5_1, or $LISTEN_MODEL)
+#   listen -c           also copy the transcript to the clipboard
+#   listen -k           keep the recording instead of deleting it
+#
+# The other half of bin/say. Together they are the voice interface: `say` talks,
+# `listen` hears.
+#
+# -f EXISTS FOR bin/ptt. Push-to-talk does its own recording, because the key
+# press and the key release arrive as two separate sway `exec`s and there is no
+# stdin to read Enter from. It still wants this script's model resolution, which
+# is subtle enough (see DEFAULT_MODEL below) that having two copies of it would
+# be a bug waiting to happen. So ptt records, and hands the file to `listen -f`.
+#
+# WHY THIS NEEDS A USB SOUND CARD
+#
+# Raspberry Pi boards have NO analog audio input — the bcm2835 audio is
+# output-only and the 3.5mm jack cannot take a microphone. Without a USB or
+# Bluetooth capture device `arecord -l` lists nothing at all and this script has
+# nothing to record from. See CLAUDE.md.
+#
+# WHISPER IS HAND-BUILT
+#
+# Not packaged for bullseye, so it is compiled into ~/.local/share/whisper.cpp
+# and is UNMANAGED by dpkg — same category as piper and the Nerd Font. A fresh
+# image loses it.
+#
+# 16 kHz mono is not a preference: whisper.cpp requires exactly that, and will
+# refuse a file recorded at any other rate.
+
+set -uo pipefail
+
+WHISPER_DIR="${WHISPER_DIR:-$HOME/.local/share/whisper.cpp}"
+MODEL_DIR="$WHISPER_DIR/models"
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+# The binary was called `main` for years and is `whisper-cli` in newer releases;
+# both may exist in a build tree. Prefer the new name, accept the old.
+find_bin() {
+    local c
+    for c in "$WHISPER_DIR/build/bin/whisper-cli" "$WHISPER_DIR/build/bin/main" \
+             "$WHISPER_DIR/whisper-cli" "$WHISPER_DIR/main"; do
+        [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+duration=""; model=""; copy=0; keep=0; infile=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -d|--duration) duration="${2:-}"; shift 2 || die "listen: -d needs seconds" ;;
+        -f|--file)     infile="${2:-}";   shift 2 || die "listen: -f needs a path" ;;
+        -m|--model)    model="${2:-}";    shift 2 || die "listen: -m needs a model" ;;
+        -c|--copy)     copy=1; shift ;;
+        -k|--keep)     keep=1; shift ;;
+        -h|--help)     sed -n '3,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        *)             die "listen: unknown option '$1'" ;;
+    esac
+done
+
+[ -n "$infile" ] && [ -n "$duration" ] && die "listen: -f and -d are mutually exclusive"
+
+BIN=$(find_bin) || die "listen: whisper.cpp binary not found under $WHISPER_DIR"
+
+# Resolve the model: explicit -m, else $LISTEN_MODEL, else the default below,
+# else whatever is actually installed.
+#
+# This used to pick the SMALLEST file, which was a trap: adding a quantized model
+# silently changed the default, because ggml-base.en-q5_1 (57 MB) is smaller than
+# ggml-tiny.en (75 MB) while being a bigger, slower, more accurate model. Name the
+# default explicitly instead.
+#
+# base.en-q5_1 is the default because ACCURACY WON — a reversal, decided
+# 2026-08-05, and the reasoning it replaces is worth keeping.
+#
+# The old default was tiny.en, chosen purely on latency: on 4.6 s of audio it
+# takes 13.5 s against base.en-q5_1's 24.6 s. That was the right call when the
+# only measurement available was a benchmark phrase both models got word-perfect,
+# so the extra ~11 s bought nothing visible.
+#
+# Two things changed. The mic became a RØDE VideoMic GO II, so SNR stopped being
+# the limiting factor; and bin/ptt made this a DICTATION tool rather than a
+# transcription toy. Real prose exposed what a benchmark phrase hid — tiny.en
+# turned "a giant blob of plasma" into "a giant blob of plaid mode". It handles
+# common words and drops exactly the technical ones you are least willing to
+# retype. Against a ~14 s wait you were already tolerating, ~25 s is cheap.
+#
+# Quantized beats fp16 on this CPU: whisper is memory-bandwidth bound here, so
+# base.en-q5_1 is both FASTER and SMALLER than fp16 base.en (24.6 s / 57 MB
+# against 34.3 s / 142 MB) for identical output. Never reach for fp16 base.en.
+# small.en-q5_1 is word-perfect and unusable at 72.4 s, 15.7x real time.
+#
+# Reach back for tiny.en with -m when latency matters more than words.
+DEFAULT_MODEL="${LISTEN_MODEL:-base.en-q5_1}"
+
+resolve_model() {
+    case "$1" in
+        /*) printf '%s' "$1"; return ;;
+        *)  printf '%s/ggml-%s.bin' "$MODEL_DIR" "$1" ;;
+    esac
+}
+
+if [ -n "$model" ]; then
+    MODEL=$(resolve_model "$model")
+    [ -f "$MODEL" ] || die "listen: no such model: $model (looked for $MODEL)"
+else
+    MODEL=$(resolve_model "$DEFAULT_MODEL")
+    if [ ! -f "$MODEL" ]; then
+        # Default is not installed — fall back to any model rather than failing.
+        MODEL=$(ls -S "$MODEL_DIR"/ggml-*.bin 2>/dev/null | tail -1)
+    fi
+fi
+[ -n "${MODEL:-}" ] && [ -f "$MODEL" ] || die "listen: no model found in $MODEL_DIR"
+
+### Encoder audio context — the single biggest speed lever on this board.
+#
+# Whisper's encoder processes a fixed 30-second window no matter how short the
+# clip is, and on this CPU that fixed cost is ~90% of a short transcription.
+# `-ac N` shrinks that window. Measured on base.en-q5_1 with a 5 s clip, best of
+# three interleaved runs: 12.9 s default, 5.2 s with -ac 512. Same transcript.
+#
+# 1500 frames cover 30 s, so audio needs duration x 50 frames. This asks for
+# DOUBLE that, because undersizing is punished savagely — a 30 s clip forced
+# through -ac 512 took 101.9 s against 26.1 s at full context, FOUR TIMES SLOWER,
+# and returned "the lazy easy- decay rocks" where the default got the sentence
+# right. Whisper's temperature fallback retries low-confidence output, so too
+# small a context loses on both speed and accuracy at once. It is strictly worse
+# than not using the flag.
+#
+# Above ~15 s of audio the doubled requirement reaches 1500 and this prints
+# nothing, so long recordings silently fall back to stock behaviour and can never
+# hit that cliff.
+#
+# $LISTEN_AUDIO_CTX overrides: 0 disables the flag entirely, N forces a value.
+audio_ctx_for() {
+    [ "${LISTEN_AUDIO_CTX:-auto}" = "0" ] && return 0
+    if [ "${LISTEN_AUDIO_CTX:-auto}" != "auto" ]; then
+        printf '%s' "$LISTEN_AUDIO_CTX"; return 0
+    fi
+    python3 - "$1" <<'PY' 2>/dev/null
+import sys, wave
+try:
+    w = wave.open(sys.argv[1])
+    secs = w.getnframes() / float(w.getframerate())
+except Exception:
+    sys.exit(0)                      # unreadable: say nothing, use the default
+ctx = int(secs * 50.0 * 2.0) + 1     # 50 frames/s, doubled for headroom
+if ctx >= 1500:
+    sys.exit(0)                      # full context is the default; pass no flag
+print(max(256, ctx))
+PY
+}
+
+if [ -n "$infile" ]; then
+    # Someone else's file. Never delete it, whatever -k says.
+    [ -f "$infile" ] || die "listen: no such file: $infile"
+    [ -s "$infile" ] || die "listen: empty recording: $infile"
+    wav="$infile"
+else
+    command -v arecord >/dev/null || die "listen: arecord not found (install alsa-utils)"
+    arecord -l 2>/dev/null | grep -q '^card' \
+        || die "listen: no capture device. This board has no built-in mic — plug in a USB one."
+
+    wav=$(mktemp /tmp/listen-XXXXXX.wav)
+    cleanup() { [ "$keep" = 1 ] || rm -f "$wav"; }
+    trap cleanup EXIT INT TERM
+
+    # 16 kHz mono, signed 16-bit — exactly what whisper.cpp wants.
+    if [ -n "$duration" ]; then
+        printf '  recording %ss — speak now\n' "$duration" >&2
+        arecord -q -f S16_LE -r 16000 -c 1 -d "$duration" "$wav" 2>/dev/null
+    else
+        printf '  recording — press Enter to stop\n' >&2
+        arecord -q -f S16_LE -r 16000 -c 1 "$wav" 2>/dev/null &
+        rec_pid=$!
+        read -r _ </dev/tty 2>/dev/null || true
+        kill "$rec_pid" 2>/dev/null
+        wait "$rec_pid" 2>/dev/null
+    fi
+
+    [ -s "$wav" ] || die "listen: nothing was recorded"
+fi
+
+AC=$(audio_ctx_for "$wav")
+AC_ARGS=""
+[ -n "${AC:-}" ] && AC_ARGS="-ac $AC"
+
+printf '  transcribing (%s%s)...\n' "$(basename "$MODEL")" \
+       "$([ -n "${AC:-}" ] && printf ', ac=%s' "$AC")" >&2
+# -nt drops timestamps, -np drops the progress banner, so stdout is just text.
+# Beam search is deliberately left at its default of 5. `-bs 1` is a further 1.4x
+# on top of -ac, but beam search is a real accuracy safeguard and this box has
+# already chosen accuracy over speed once, when tiny.en turned "plasma" into
+# "plaid mode". One clean test sentence is not enough evidence to give it up.
+text=$("$BIN" -m "$MODEL" -f "$wav" -l en -nt -np $AC_ARGS 2>/dev/null | tr -d '\r' \
+        | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | paste -sd' ' -)
+
+[ -n "${text:-}" ] || die "listen: no speech recognised"
+printf '%s\n' "$text"
+
+if [ "$copy" = 1 ]; then
+    if command -v wl-copy >/dev/null 2>&1; then
+        printf '%s' "$text" | wl-copy
+        printf '  (copied to clipboard)\n' >&2
+    else
+        printf '  (wl-copy not installed — install wl-clipboard to use -c)\n' >&2
+    fi
+fi
+[ "$keep" = 1 ] && [ -z "$infile" ] && printf '  recording kept at %s\n' "$wav" >&2
+exit 0

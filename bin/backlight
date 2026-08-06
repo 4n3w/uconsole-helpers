@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#
+# backlight — step the uConsole's panel backlight.
+#
+#   backlight up        one level brighter
+#   backlight down      one level dimmer
+#   backlight get       print "current/max"
+#   backlight set N     absolute level
+#
+# Bound to the keyboard's own brightness keys in sway/10-uconsole.conf. The
+# firmware emits real KEY_BRIGHTNESSDOWN/UP from a separate HID device
+# ("ClockworkPI uConsole Consumer Control", event3) — nothing was listening to
+# them, which is why the Fn+</> icons appeared dead.
+#
+# NO SUDO. /sys/class/backlight/backlight@0/brightness is mode rw-rw-rw- on this
+# board, so a plain user can write it. Do not add a sudo wrapper or a helper
+# daemon; neither is needed.
+#
+# Why this matters more than it looks: this kernel has no suspend at all
+# (/sys/power/state is empty), so the backlight is the only real power lever.
+# Measured on-device, it is ~46% of total draw at maximum — 1168 mA at level 9
+# against 627 mA at level 0.
+
+set -uo pipefail
+
+BL=/sys/class/backlight/backlight@0
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+[ -d "$BL" ] || die "backlight: $BL not present"
+[ -w "$BL/brightness" ] || die "backlight: $BL/brightness is not writable"
+
+max=$(cat "$BL/max_brightness" 2>/dev/null) || die "backlight: cannot read max_brightness"
+cur=$(cat "$BL/brightness"     2>/dev/null) || die "backlight: cannot read brightness"
+
+# The step floor is 1, not 0, on purpose.
+#
+# Level 0 is NOT off — it is minimum, and draws essentially the same as level 1
+# (627 mA vs 630 mA measured). But it may be too dim to read, and walking the
+# brightness key down to an unreadable screen with no lock screen and no way to
+# see what you are typing is a bad place to be. `set 0` is still allowed for
+# anyone who explicitly wants it; only the stepping keys are floored.
+#
+# To actually cut the backlight, blank the output instead — that sets bl_power=4
+# (FB_BLANK_POWERDOWN) and measured 599 mA, below level 0:
+#     swaymsg "output * dpms off"
+FLOOR=1
+
+clamp() {   # clamp <value> <lo>
+    local v="$1" lo="$2"
+    [ "$v" -lt "$lo" ] && v="$lo"
+    [ "$v" -gt "$max" ] && v="$max"
+    printf '%s' "$v"
+}
+
+case "${1:-}" in
+    up)   printf '%s' "$(clamp $(( cur + 1 )) "$FLOOR")" > "$BL/brightness" ;;
+    down) printf '%s' "$(clamp $(( cur - 1 )) "$FLOOR")" > "$BL/brightness" ;;
+    get)  printf '%s/%s\n' "$cur" "$max" ;;
+    set)
+        [ -n "${2:-}" ] || die "usage: backlight set N   (0-$max)"
+        case "$2" in
+            ''|*[!0-9]*) die "backlight: '$2' is not a number" ;;
+        esac
+        printf '%s' "$(clamp "$2" 0)" > "$BL/brightness"
+        ;;
+    *)    die "usage: backlight [up|down|get|set N]" ;;
+esac

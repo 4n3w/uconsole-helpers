@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+#
+# battery-remaining — print battery percentage and estimated time, e.g. "72% 2h26m".
+#
+# Written for starship's [custom.battery] module, but usable anywhere. Prints
+# nothing and exits 1 when there is no battery, so the same invocation works as
+# starship's `when` guard and the module stays hidden on desktops and on macOS.
+#
+# The uConsole's axp20x PMU does NOT expose time_to_empty_now, so the estimate is
+# computed. Preference order:
+#
+#   1. power_now                    (µW, if the driver provides it)
+#   2. voltage_now * current_now    (µV * µA -> µW; what the axp20x gives us)
+#
+# then  minutes = energy_now(µWh) * 60 / power(µW), or the charge_now/current_now
+# equivalent for drivers that report charge (µAh) rather than energy (µWh).
+#
+# All arithmetic is integer. The products reach ~2.5e12, which is fine in bash's
+# 64-bit arithmetic but would overflow 32-bit — do not port this to a shell
+# without 64-bit math.
+
+set -uo pipefail
+
+read_prop() { cat "$BAT/$1" 2>/dev/null; }
+
+# First power supply of type Battery.
+BAT=""
+for d in /sys/class/power_supply/*/; do
+    [ "$(cat "$d/type" 2>/dev/null)" = "Battery" ] || continue
+    BAT="${d%/}"
+    break
+done
+[ -n "$BAT" ] || exit 1
+
+capacity=$(read_prop capacity)
+status=$(read_prop status)
+[ -n "$capacity" ] || exit 1
+
+# Work out power draw in µW.
+power=$(read_prop power_now)
+if [ -z "${power:-}" ] || [ "${power:-0}" -eq 0 ] 2>/dev/null; then
+    v=$(read_prop voltage_now)
+    i=$(read_prop current_now)
+    if [ -n "${v:-}" ] && [ -n "${i:-}" ] && [ "$i" -gt 0 ] 2>/dev/null; then
+        power=$(( v * i / 1000000 ))
+    else
+        power=0
+    fi
+fi
+
+# Energy remaining (discharging) or energy still needed (charging), in µWh.
+energy_now=$(read_prop energy_now)
+energy_full=$(read_prop energy_full)
+if [ -z "${energy_now:-}" ]; then
+    # Driver reports charge (µAh) instead of energy (µWh); convert with voltage.
+    charge_now=$(read_prop charge_now)
+    charge_full=$(read_prop charge_full)
+    v=$(read_prop voltage_now)
+    if [ -n "${charge_now:-}" ] && [ -n "${v:-}" ]; then
+        energy_now=$(( charge_now * v / 1000000 ))
+        [ -n "${charge_full:-}" ] && energy_full=$(( charge_full * v / 1000000 ))
+    fi
+fi
+
+case "$status" in
+    Charging) budget=$(( ${energy_full:-0} - ${energy_now:-0} )); arrow="+" ;;
+    *)        budget=${energy_now:-0};                            arrow="" ;;
+esac
+
+if [ "$power" -gt 0 ] && [ "$budget" -gt 0 ] 2>/dev/null; then
+    mins=$(( budget * 60 / power ))
+    printf '%s%% %s%dh%02dm\n' "$capacity" "$arrow" $(( mins / 60 )) $(( mins % 60 ))
+else
+    # Full, idle, or the driver is not reporting current — percentage only.
+    printf '%s%%\n' "$capacity"
+fi

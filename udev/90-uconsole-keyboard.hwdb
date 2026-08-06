@@ -1,0 +1,42 @@
+# uConsole built-in keyboard — remap right Alt to Super.
+#
+# WHY
+# The board has no dedicated Super key. The only stock route is Fn+Alt (the orange
+# "Cmd" sublegend), which the keyboard firmware resolves internally and emits as a
+# single clean KEY_RIGHTMETA — the kernel never sees a chord. That works, but it
+# makes every sway window command a three-key press on a handheld.
+#
+# This rewrites right Alt to Super at the evdev layer, below xkb, so it applies
+# identically in the TTY and under sway. $mod stays Mod4, and the portable sway
+# config shared via `dotfiles` needs no change at all.
+#
+# COSTS
+# Right Alt is no longer AltGr. Left Alt (700e2) is untouched. Fn+Alt still emits
+# KEY_RIGHTMETA, so Super survives even with this file removed — the remap is an
+# ergonomic convenience, not a prerequisite.
+#
+# SCANCODES  (captured on-device 2026-07-27 via `evtest /dev/input/event4`)
+#   right Alt  MSC_SCAN 700e6  KEY_RIGHTALT  (100)   <- remapped below
+#   left Alt   MSC_SCAN 700e2  KEY_LEFTALT   (56)
+#   Fn+Alt     MSC_SCAN 700e7  KEY_RIGHTMETA (126)
+# 700e6 is HID usage page 0x07 ("Keyboard"), usage 0xE6 ("Keyboard Right Alt").
+#
+# MATCH is the USB HID id from /sys/class/input/event4/device/modalias:
+#   input:b0003v1EAFp0024e0110-...
+# 1EAF:0024 is the LeafLabs Maple MCU that drives the uConsole keyboard.
+#
+# APPLY
+#   sudo cp 90-uconsole-keyboard.hwdb /etc/udev/hwdb.d/
+#   sudo systemd-hwdb update && sudo udevadm trigger --subsystem-match=input
+# REVERT
+#   sudo rm /etc/udev/hwdb.d/90-uconsole-keyboard.hwdb
+#   sudo systemd-hwdb update && sudo udevadm trigger --subsystem-match=input
+# VERIFY
+#   udevadm info /dev/input/event4 | grep KEYBOARD_KEY   # rule matched?
+#   sudo evtest /dev/input/event4                        # right Alt -> KEY_LEFTMETA
+#
+# FORMAT NOTE: the match line starts at column 0; the property line beneath it must
+# begin with exactly one space. Getting that wrong makes the rule silently inert.
+
+evdev:input:b0003v1EAFp0024*
+ KEYBOARD_KEY_700e6=leftmeta

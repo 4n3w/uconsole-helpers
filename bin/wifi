@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+#
+# wifi — bring the uConsole's wifi up or down.
+#
+# wlan0 is deliberately NOT managed by NetworkManager; see
+# /etc/NetworkManager/conf.d/10-uconsole-wlan0-unmanaged.conf. The network and its
+# passphrase live in /etc/wpa_supplicant/wpa_supplicant.conf, which is the single
+# source of truth.
+#
+# Passphrase handling: every subcommand but `add` only starts and stops daemons and
+# never touches the passphrase at all. `add` does handle one, but never in argv and
+# never in a shell variable — see do_add.
+#
+# Nothing runs at boot. wlan0 stays down until `wifi on`.
+#
+#   wifi            fzf menu
+#   wifi on         link up, associate, get a DHCP lease
+#   wifi off        release the lease, stop the daemons, link down
+#   wifi status     link state, daemon, address, configured networks
+#   wifi restart    off then on
+#   wifi edit       edit wpa_supplicant.conf, then restart if it was up
+#   wifi add SSID   append a network, prompting for the passphrase
+
+set -uo pipefail
+
+IFACE=wlan0
+CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+WPA_PID=/run/wpa_supplicant-$IFACE.pid
+DH_PID=/run/dhclient-$IFACE.pid
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+[ -e "/sys/class/net/$IFACE" ] || die "wifi: no $IFACE interface present"
+
+# Match only OUR wpa_supplicant via its pidfile. NetworkManager runs a separate
+# global wpa_supplicant (-u -s -O /run/wpa_supplicant); a pkill pattern could
+# take that one down by accident, a pidfile cannot.
+#
+# The pidfile is root-owned in /run, so it needs sudo to read; and `kill -0`
+# against a root-owned pid fails with EPERM for a normal user. Test /proc
+# instead, which works regardless of ownership.
+wpa_pid() { sudo sh -c "cat '$WPA_PID' 2>/dev/null"; }
+
+running() {
+    local p; p=$(wpa_pid)
+    [ -n "$p" ] && [ -d "/proc/$p" ]
+}
+
+do_status() {
+    printf 'link       : %s\n' "$(cat "/sys/class/net/$IFACE/operstate" 2>/dev/null)"
+    printf 'daemon     : %s\n' "$(running && echo running || echo stopped)"
+    printf 'address    : %s\n' "$(ip -brief -4 addr show "$IFACE" 2>/dev/null | awk '{print $3}')"
+    printf 'configured : %s\n' \
+        "$(sudo sed -n 's/^[[:space:]]*ssid="\(.*\)"[[:space:]]*$/\1/p' "$CONF" 2>/dev/null | paste -sd', ' -)"
+}
+
+do_on() {
+    if running; then printf 'already up\n\n'; do_status; return 0; fi
+    sudo ip link set "$IFACE" up || die "wifi: could not bring $IFACE up"
+    sudo wpa_supplicant -B -i "$IFACE" -c "$CONF" -P "$WPA_PID" \
+        || die "wifi: wpa_supplicant failed to start"
+    sleep 6
+    sudo dhclient -1 -pf "$DH_PID" "$IFACE" || die "wifi: no DHCP lease"
+    printf '\n'; do_status
+}
+
+do_off() {
+    sudo dhclient -r -pf "$DH_PID" "$IFACE" >/dev/null 2>&1
+    local p; p=$(wpa_pid)
+    [ -n "$p" ] && sudo kill "$p" 2>/dev/null
+    sudo rm -f "$WPA_PID" "$DH_PID"
+    sudo ip addr flush dev "$IFACE" 2>/dev/null
+    sudo ip link set "$IFACE" down
+    do_status
+}
+
+do_restart() { do_off >/dev/null; do_on; }
+
+# Append a network block. wpa_supplicant tries every configured network and
+# associates with whichever is in range, so adding one never disturbs the others.
+#
+# The passphrase is deliberately never a shell variable and never an argument:
+# wpa_passphrase reads it straight from the terminal on stdin, and its output is
+# piped directly to `tee`. So it appears in neither shell history nor
+# /proc/<pid>/cmdline, and this script never holds it.
+#
+# The pipe also cleans up three things wpa_passphrase does that we do not want:
+#
+#   1. it echoes the plaintext back as a `#psk="..."` comment, which would otherwise
+#      sit in the file forever. Dropped mid-pipe, before it ever reaches disk.
+#   2. it prints "# reading passphrase from stdin" on STDOUT, not stderr, so that
+#      lands in the config too. Harmless to wpa_supplicant, but it accumulates one
+#      junk line per add. Both go via a single "drop all comments" rule.
+#   3. it indents with tabs and omits key_mgmt. Normalised to 4 spaces with an
+#      explicit key_mgmt so added blocks match the hand-written ones.
+do_add() {
+    local ssid="${1:-}"
+    if [ -z "$ssid" ]; then
+        printf 'SSID: '
+        read -r ssid
+    fi
+    [ -n "$ssid" ] || die 'wifi: no SSID given'
+
+    # A duplicate is worse than an error: wpa_supplicant would take whichever
+    # block it reaches first and the other becomes silently dead config.
+    if sudo grep -qF "ssid=\"$ssid\"" "$CONF" 2>/dev/null; then
+        die "wifi: \"$ssid\" is already configured — use \`wifi edit\` to change it"
+    fi
+
+    sudo cp -p "$CONF" "$CONF.bak" || die "wifi: could not back up $CONF"
+
+    printf '\n' | sudo tee -a "$CONF" >/dev/null
+    if ! wpa_passphrase "$ssid" \
+        | sed -e '/^[[:space:]]*#/d' -e 's/^\t/    /' \
+        | awk '{ print } /^[[:space:]]*psk=/ { print "    key_mgmt=WPA-PSK" }' \
+        | sudo tee -a "$CONF" >/dev/null; then
+        # wpa_passphrase rejects anything outside 8-63 characters and writes
+        # nothing on failure, but restore anyway rather than leave a stray newline.
+        sudo cp -p "$CONF.bak" "$CONF"
+        die 'wifi: wpa_passphrase failed — passphrase must be 8-63 characters'
+    fi
+
+    printf 'added "%s" (previous config saved to %s)\n\n' "$ssid" "$CONF.bak"
+    running && do_restart || do_status
+}
+
+do_edit() {
+    local was_up=no
+    running && was_up=yes
+    sudo "${EDITOR:-vi}" "$CONF"
+    [ "$was_up" = yes ] && do_restart || do_status
+}
+
+menu() {
+    command -v fzf >/dev/null || die "wifi: fzf is not installed"
+    printf '%s\n' \
+        "status   link state, daemon, address, configured networks" \
+        "on       link up, associate, get a DHCP lease" \
+        "off      release lease, stop daemons, link down" \
+        "restart  off then on" \
+        "add      append a network, prompting for the passphrase" \
+        "edit     edit wpa_supplicant.conf" |
+        fzf --height=60% --layout=reverse --border --prompt='wifi> ' |
+        awk '{print $1}'
+}
+
+cmd="${1:-}"
+[ -z "$cmd" ] && cmd=$(menu)
+[ -z "$cmd" ] && exit 0
+
+case "$cmd" in
+    status)  do_status ;;
+    on)      do_on ;;
+    off)     do_off ;;
+    restart) do_restart ;;
+    edit)    do_edit ;;
+    add)     do_add "${2:-}" ;;
+    *)       die "usage: wifi [status|on|off|restart|edit|add SSID]" ;;
+esac

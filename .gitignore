@@ -1,0 +1,10 @@
+# Python bytecode. hooks/*.py are executed directly, so these are pure build
+# artifacts — and they were briefly committed, which is how this file came to
+# exist. .pyc files also embed absolute source paths.
+__pycache__/
+*.py[cod]
+
+# Editor and OS noise
+*~
+.*.swp
+.DS_Store
