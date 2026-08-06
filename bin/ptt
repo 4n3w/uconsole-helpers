@@ -1,29 +1,40 @@
 #!/usr/bin/env bash
 #
-# ptt — push-to-talk dictation. Hold a key, speak, release; the text types
-# itself into whatever window has focus.
+# ptt — dictation. Tap a key, speak, tap again; the text types itself into
+# whatever window has focus.
 #
-#   ptt start     begin recording          (bound to the key PRESS)
-#   ptt stop      end, transcribe, type    (bound to the key RELEASE)
-#   ptt toggle    press-once/press-again, for testing or a non-hold binding
-#   ptt cancel    throw the recording away without transcribing
-#   ptt status    print whether a recording is live
+#   ptt toggle          tap to start, tap again to stop      ($mod+/)
+#   ptt toggle --enter  the same, then press Return          ($mod+\)
+#   ptt start [--enter] begin recording
+#   ptt stop            end, transcribe, type
+#   ptt cancel          throw the recording away without transcribing
+#   ptt status          print whether a recording is live
 #
-# Bound in sway/10-uconsole.conf as $mod+backslash. See that file for why it is
-# NOT Fn+backslash, which is what you actually want and cannot have.
+# Both bindings live in sway/10-uconsole.conf. See that file for why neither is
+# Fn+backslash, which is what you actually want and cannot have.
+#
+# TOGGLE, NOT HOLD. This began as push-to-talk — hold $mod+\, speak, release —
+# using sway's --release binding. That works and went unused: holding a key
+# through a paragraph is tiring, and dictation is mostly paragraphs. `start` and
+# `stop` remain as primitives, so a hold binding can be restored in two lines,
+# but nothing ships bound to them.
+#
+# --enter is the whole reason for keeping two keys. $mod+\ appends a Return so a
+# dictated prompt submits itself; $mod+/ leaves the line for you to edit. Same
+# machinery, one flag.
 #
 # HOW THE TWO HALVES FIND EACH OTHER
 #
-# sway fires `exec` for the press and `exec` for the release as two completely
-# separate, detached processes. They share nothing — no pipe, no parent, no
-# stdin. So `start` leaves a state file behind and `stop` picks it up. That is
-# the whole architecture, and it is why this could not just be `bin/listen`.
+# The two taps are two completely separate, detached sway `exec`s. They share
+# nothing — no pipe, no parent, no stdin. So the first leaves a state file behind
+# and the second picks it up. That is the whole architecture, and it is why this
+# could not just be `bin/listen`.
 #
-# The state file holds pid, wav path and start time on one line. `stop` reads it
-# and DELETES IT IMMEDIATELY, before doing any of the slow work, so that a new
-# recording can begin while the previous one is still transcribing. The wav path
-# is unique per recording for the same reason — a fixed path would be clobbered
-# mid-transcription by the next key press.
+# The state file holds pid, wav path, start time and the submit flag on one line.
+# `stop` reads it and DELETES IT IMMEDIATELY, before any of the slow work, so a
+# new recording can begin while the previous one is still transcribing. The wav
+# path is unique per recording for the same reason — a fixed path would be
+# clobbered mid-transcription by the next tap.
 #
 # WHY THE BEEP COMES BEFORE THE RECORDING, NOT DURING IT
 #
@@ -37,9 +48,9 @@
 # The stop and error tones are backgrounded, because by then nothing is listening
 # and the latency would be pure cost.
 #
-# SAFETY: arecord is started with a hard -d limit. sway can miss a --release
-# binding (change focus mid-hold and the release never arrives), and without the
-# limit a missed release means arecord fills the SD card overnight.
+# SAFETY: arecord is started with a hard -d limit, so a toggle you forget cannot
+# fill the SD card overnight. When it expires nothing is transcribed and nothing
+# typed; the next tap simply starts afresh.
 
 set -uo pipefail
 
@@ -73,6 +84,16 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
     && tail -n 200 "$LOG" >"$LOG.tmp" && mv "$LOG.tmp" "$LOG"
 
 now_ms() { date +%s%3N; }
+
+# Accepts --enter/-e (or nothing) and echoes 1/0. Kept permissive rather than
+# erroring on an unknown argument: this is invoked from a sway binding, where a
+# non-zero exit is invisible and silence would look like a broken key.
+want_enter() {
+    case "${1:-}" in
+        --enter|-e|enter|1) printf '1' ;;
+        *)                  printf '0' ;;
+    esac
+}
 
 ### Tones
 #
@@ -193,9 +214,9 @@ PY
 read_state() {
     [ -f "$STATE" ] || return 1
     local pid wav started
-    read -r pid wav started <"$STATE" || return 1
+    read -r pid wav started enter <"$STATE" || return 1
     [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] || return 1
-    printf '%s %s %s' "$pid" "$wav" "$started"
+    printf '%s %s %s %s' "$pid" "$wav" "$started" "${enter:-0}"
 }
 
 # A state file naming a process that no longer exists means the recording ended
@@ -205,8 +226,8 @@ read_state() {
 # it now rather than waiting for the hourly prune in do_start.
 reap_stale() {
     [ -f "$STATE" ] || return 0
-    local pid wav started
-    read -r pid wav started <"$STATE" 2>/dev/null || { rm -f "$STATE"; return 0; }
+    local pid wav started enter
+    read -r pid wav started enter <"$STATE" 2>/dev/null || { rm -f "$STATE"; return 0; }
     [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] && return 0   # still live, leave alone
     [ -n "${wav:-}" ] && rm -f "$wav"
     rm -f "$STATE"
@@ -216,6 +237,11 @@ reap_stale() {
 ### Actions
 
 do_start() {
+    # $1 is the submit flag. It is recorded HERE, at the start, rather than read
+    # from whichever key stops the recording — the two presses are separate
+    # processes, and "the key I pressed to begin is the one that decides" is the
+    # predictable rule. Stopping a $mod+\ recording with $mod+/ still submits.
+    local enter="${1:-0}"
     reap_stale
 
     # A live recording here means the previous key release never arrived — sway
@@ -225,9 +251,9 @@ do_start() {
     # The tempting alternative, ignoring the press, is much worse: it leaves the
     # key dead until arecord hits its own -d ceiling, so one missed release
     # breaks dictation for MAX_SECONDS with no indication why.
-    local orphan opid owav ostarted
+    local orphan opid owav ostarted oenter
     if orphan=$(read_state); then
-        read -r opid owav ostarted <<<"$orphan"
+        read -r opid owav ostarted oenter <<<"$orphan"
         rm -f "$STATE"
         kill "$opid" 2>/dev/null
         wait "$opid" 2>/dev/null
@@ -249,15 +275,15 @@ do_start() {
     arecord -q -f S16_LE -r 16000 -c 1 -d "$MAX_SECONDS" "$wav" >/dev/null 2>&1 &
     local pid=$!
 
-    printf '%s %s %s\n' "$pid" "$wav" "$started" >"$STATE"
-    log "start: pid=$pid wav=$wav"
+    printf '%s %s %s %s\n' "$pid" "$wav" "$started" "$enter" >"$STATE"
+    log "start: pid=$pid wav=$wav enter=$enter"
 }
 
 do_stop() {
     reap_stale
-    local state pid wav started
+    local state pid wav started enter
     state=$(read_state) || { log "stop: nothing recording"; rm -f "$STATE"; return 0; }
-    read -r pid wav started <<<"$state"
+    read -r pid wav started enter <<<"$state"
 
     # Clear the slot BEFORE the slow work, so the next press is free to start.
     rm -f "$STATE"
@@ -311,7 +337,7 @@ do_stop() {
     fi
 
     log "stop: -> $cleaned"
-    emit "$cleaned"
+    emit "$cleaned" "$enter"
 }
 
 # Strip whisper's non-speech annotations.
@@ -346,8 +372,10 @@ clean_text() {
 # `--` is mandatory, not defensive: a transcript beginning with a dash would
 # otherwise be parsed as wtype options.
 emit() {
-    local text="$1"
-    [ "$TRAILING_SPACE" = 1 ] && text="$text "
+    local text="$1" enter="${2:-0}"
+    # A trailing space is for chaining utterances; when the line is about to be
+    # submitted it is just a stray space before Enter.
+    [ "$TRAILING_SPACE" = 1 ] && [ "$enter" != 1 ] && text="$text "
 
     if [ -z "${WAYLAND_DISPLAY:-}" ]; then
         # Run by hand from a TTY or over SSH. Just print it.
@@ -356,7 +384,13 @@ emit() {
     fi
 
     if command -v wtype >/dev/null; then
-        wtype -- "$text" 2>>"$LOG" && return 0
+        if wtype -- "$text" 2>>"$LOG"; then
+            # Return is sent as a SEPARATE keystroke, not "\n" inside the text.
+            # wtype types a literal newline as a character; only -k Return
+            # produces the keypress a prompt reads as submit.
+            [ "$enter" = 1 ] && wtype -k Return 2>>"$LOG"
+            return 0
+        fi
         log "emit: wtype failed, falling back to clipboard"
     fi
 
@@ -371,9 +405,9 @@ emit() {
 
 do_cancel() {
     reap_stale
-    local state pid wav started
+    local state pid wav started enter
     state=$(read_state) || { rm -f "$STATE"; return 0; }
-    read -r pid wav started <<<"$state"
+    read -r pid wav started enter <<<"$state"
     rm -f "$STATE"
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
@@ -383,9 +417,9 @@ do_cancel() {
 }
 
 do_status() {
-    local state pid wav started
+    local state pid wav started enter
     if state=$(read_state); then
-        read -r pid wav started <<<"$state"
+        read -r pid wav started enter <<<"$state"
         printf 'recording  %ss elapsed  (pid %s)\n' \
             "$(( ( $(now_ms) - started ) / 1000 ))" "$pid"
     else
@@ -394,11 +428,11 @@ do_status() {
 }
 
 case "${1:-}" in
-    start)  do_start ;;
+    start)  do_start "$(want_enter "${2:-}")" ;;
     stop)   do_stop ;;
-    toggle) if read_state >/dev/null; then do_stop; else do_start; fi ;;
+    toggle) if read_state >/dev/null; then do_stop; else do_start "$(want_enter "${2:-}")"; fi ;;
     cancel) do_cancel ;;
     status) do_status ;;
-    -h|--help|help|'') sed -n '3,12p' "$0" | sed 's/^# \?//' ;;
+    -h|--help|help|'') sed -n '3,11p' "$0" | sed 's/^# \?//' ;;
     *)      printf 'ptt: unknown command %s\n' "$1" >&2; exit 1 ;;
 esac

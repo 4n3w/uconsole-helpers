@@ -257,7 +257,7 @@ Nothing outstanding. `tty/rose-pine-tty.sh` was **confirmed painting on a real V
 | `bin/say` | speaks text aloud via piper. Reads stdin, so anything can pipe into it. `-l` lists voices, `-v` picks one, `-w` renders to WAV, `--stop` interrupts. Bound to `$mod+p` (speak selection) and `$mod+Shift+p` (stop) |
 | `bin/listen` | records and transcribes with whisper.cpp. Records until Enter, or `-d N` seconds. `-f FILE` transcribes an existing wav. `-c` copies to clipboard |
 | `bin/audio` | `status`/`out`/`in`/`vol`/`mute`/`mic`/`test`/`level` for PulseAudio and ALSA, plus an fzf menu with no args |
-| `bin/ptt` | dictation. `start`/`stop`/`toggle`/`cancel`/`status`. Bound in `10-uconsole.conf` to `$mod+\` (hold) and `$mod+/` (toggle); types the transcript into the focused window |
+| `bin/ptt` | dictation. `toggle [--enter]`/`start`/`stop`/`cancel`/`status`. Bound in `10-uconsole.conf` to `$mod+/` (toggle) and `$mod+\` (toggle, then Return); types the transcript into the focused window |
 
 `wifi` and `ptt` are symlinked into `~/.local/bin`. `battery-remaining` is **not** on
 `PATH` — starship invokes it by absolute path, so nothing noticed. Symlink it too if you
@@ -739,17 +739,34 @@ piper blocked on a broken pipe until its next write, which for a long utterance 
 "immediately". It never pkills by name: `aplay` is also how `bin/ptt` plays its beeps,
 the same reasoning that stops `bin/wifi` pkilling `wpa_supplicant`.
 
-### Push-to-talk dictation — `bin/ptt`, bound to `$mod+\`
+### Dictation — `bin/ptt`, on `$mod+/` and `$mod+\`
 
-Hold `$mod+\`, speak, release; `wtype` types the transcript into the focused window.
+Tap `$mod+/`, speak, tap again; `wtype` types the transcript into the focused window.
 Added 2026-08-05, and **confirmed working by dictating with it**.
 
-**Two bindings, two modes.** `$mod+\` is hold-to-talk. `$mod+/`, the neighbouring key,
-is **toggle**: tap to start, tap again to stop. Toggle exists because holding a key
-through a whole paragraph is tiring, which is exactly when you are least willing to do
-it. `--no-repeat` matters more on the toggle binding than on the hold one — without it,
-holding the key flips recording on and off several times and lands wherever the last
-repeat left it.
+**Two bindings, both toggles, differing only in a trailing Return.** `$mod+/` types the
+transcript and leaves it for you to edit; `$mod+\` types it and presses Return, so a
+dictated prompt submits itself. One flag, `toggle --enter`, and the same machinery.
+
+**Hold-to-talk was the original design and is gone (2026-08-06).** `$mod+\` used sway's
+`--release` binding to record only while held. It worked, and went essentially unused:
+holding a key through a whole paragraph is tiring, and dictation is mostly paragraphs.
+`start` and `stop` survive as primitives, so a hold binding is two lines away, but
+nothing ships bound to them.
+
+The submit flag is recorded **at start**, in the state file, not read from whichever key
+stops the recording. The two taps are separate processes, so something has to carry it,
+and "the key I pressed to begin decides" is the predictable rule — stopping a `$mod+\`
+recording with `$mod+/` still submits.
+
+`--no-repeat` is load-bearing on both bindings. Without it, holding the key autorepeats
+`toggle` and flips recording on and off several times, landing on whichever state the
+last repeat hit — a coin flip, and a confusing one, since every beep fires.
+
+The Return is sent as a **separate keystroke**, `wtype -k Return`, not as a `\n` inside
+the typed text. wtype types a literal newline as a character; only the keypress is what a
+prompt reads as submit. The trailing space is also suppressed when submitting, since it
+would just be a stray space before Enter.
 
 A **forgotten toggle is benign**, which is worth knowing rather than assuming. `arecord`
 hits its own `-d` ceiling at `MAX_SECONDS`, exits, and *nothing is transcribed and
@@ -798,11 +815,10 @@ binary, and a bogus flag in the same position is rejected, so the check is meani
 `--no-repeat` is load-bearing: without it, holding the key autorepeats `ptt start`
 dozens of times a second.
 
-sway can **drop** a `--release` binding if focus changes mid-hold. `ptt start` therefore
-treats an already-live recording as an orphan, kills it and starts fresh. Ignoring the
-press instead — the obvious reading — is far worse: it leaves the key dead until
-`arecord` hits its own `-d` ceiling, so one missed release silently breaks dictation for
-two minutes.
+`ptt start` treats an already-live recording as an orphan, kills it and starts fresh.
+This mattered more under the old hold binding, where sway could drop a `--release` if
+focus changed mid-hold, but it is still the right behaviour: ignoring the press instead
+would leave the key dead until `arecord` hits its own `-d` ceiling.
 
 **Whisper's non-speech tags must be filtered before typing.** This is not theoretical:
 the very first test recorded three seconds of a quiet room and whisper returned
