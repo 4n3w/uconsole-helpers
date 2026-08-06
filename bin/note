@@ -1,0 +1,177 @@
+#!/usr/bin/env bash
+#
+# note — a spoken notebook. Capture by voice, retrieve by voice.
+#
+#   note                  pick and read a note (fzf, with preview)
+#   note add "text"       append an entry to today's file
+#   note add -            append from stdin — how dictation gets in
+#   note today            print today's entries
+#   note search TERM      search every note
+#   note read [N]         speak the last N entries aloud (default 1)
+#   note edit             open today's file in $EDITOR
+#   note sync             commit and push
+#
+# Bound to $mod+n in sway/10-uconsole.conf, which dictates straight into it.
+#
+# WHAT THIS ADDS OVER PLAIN DICTATION
+#
+# bin/ptt types into whatever window has focus, so it needs a focused text
+# field. Capture here has NO TARGET: it works from a blank workspace, from a
+# browser, or from a bare TTY with no compositor running at all, because writing
+# to a file never needs wtype. Combined with ptt's silence auto-stop that is one
+# keypress for a whole thought.
+#
+# And retrieval can be spoken. On a 5" panel, reading back a week of notes is
+# unpleasant; `note read` hands them to bin/say instead. Voice in, voice out —
+# the thing this device does that a laptop does not.
+#
+# ONE FILE PER DAY, APPENDED
+#
+# Because the hard part of filing a note by voice is NAMING it, and a daily file
+# needs no name. Deriving a filename from the first few transcribed words sounds
+# clever and produces `2026-08-06-1032-the-thing-about-the.md`.
+#
+# THE NOTES ARE NOT IN THIS REPO, AND MUST NOT BE
+#
+# This script is public; its contents are not. Same separation as bin/wifi, which
+# starts and stops daemons but never reads a passphrase. $NOTE_DIR defaults to
+# ~/notes, which is its own private git repo.
+#
+# TRANSCRIPTION ERRORS MATTER MORE HERE than in a dictated prompt. In a prompt a
+# wrong word is visible immediately; in a note you find it in three weeks with no
+# way to reconstruct what you meant. Hence `note edit`, and hence the entries
+# carrying a timestamp — so you can at least place what you were doing.
+
+set -uo pipefail
+
+DIR="${NOTE_DIR:-$HOME/notes}"
+SAY="${NOTE_SAY:-$(dirname "$(readlink -f "$0")")/say}"
+
+die() { printf 'note: %s\n' "$*" >&2; exit 1; }
+
+today_file() { printf '%s/%s.md' "$DIR" "$(date +%F)"; }
+
+ensure_dir() {
+    mkdir -p "$DIR" || die "cannot create $DIR"
+    # A notes directory is exactly the kind of thing you discover you wanted
+    # history for only after losing some, and this box keeps teaching that the
+    # SD card is the single point of failure. Init on first use rather than
+    # asking.
+    if [ ! -d "$DIR/.git" ]; then
+        git -C "$DIR" init -q 2>/dev/null || return 0
+        printf '# notes\n\nPrivate. Captured by `note`, mostly by voice.\n' >"$DIR/README.md"
+        git -C "$DIR" add -A 2>/dev/null
+        git -C "$DIR" commit -qm "Initial commit" 2>/dev/null
+        printf '  initialised a git repo in %s\n' "$DIR" >&2
+    fi
+}
+
+# Commit, never push. Capture must not touch the network: wifi is off by default
+# on this box, and a binding that blocks on a DNS timeout would feel broken.
+# `note sync` pushes deliberately.
+commit_quietly() {
+    [ -d "$DIR/.git" ] || return 0
+    git -C "$DIR" add -A >/dev/null 2>&1
+    git -C "$DIR" diff --cached --quiet 2>/dev/null && return 0
+    git -C "$DIR" commit -qm "note: $(date '+%F %H:%M')" >/dev/null 2>&1
+}
+
+do_add() {
+    local text
+    if [ "${1:-}" = "-" ]; then
+        text=$(cat)
+    elif [ $# -gt 0 ]; then
+        text="$*"
+    else
+        die "add needs text, or - to read stdin"
+    fi
+    text=$(printf '%s' "$text" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    [ -n "${text//[[:space:]]/}" ] || { printf 'note: nothing to add\n' >&2; exit 0; }
+
+    ensure_dir
+    local f; f=$(today_file)
+    [ -f "$f" ] || printf '# %s\n' "$(date '+%A %-d %B %Y')" >"$f"
+    printf '\n## %s\n\n%s\n' "$(date +%H:%M)" "$text" >>"$f"
+    commit_quietly
+    printf '  noted (%s)\n' "$(date +%H:%M)" >&2
+}
+
+do_today() {
+    local f; f=$(today_file)
+    [ -f "$f" ] || { printf 'note: nothing today\n' >&2; exit 0; }
+    cat "$f"
+}
+
+do_search() {
+    [ $# -gt 0 ] || die "search needs a term"
+    [ -d "$DIR" ] || die "no notes yet"
+    if command -v rg >/dev/null 2>&1; then
+        rg --no-heading --color=never -n "$*" "$DIR" 2>/dev/null
+    else
+        grep -rn "$*" "$DIR" 2>/dev/null
+    fi
+}
+
+# Speak the last N entries. Entries are separated by "## HH:MM" headings, so the
+# timestamp lines are dropped — hearing "hash hash ten thirty two" is not useful.
+do_read() {
+    local n="${1:-1}"
+    [ -d "$DIR" ] || die "no notes yet"
+    # Collect the last few day-files into one stream. Read line by line rather
+    # than word-splitting `ls`: quoting the whole list makes cat see a single
+    # filename containing newlines, which fails silently and returns nothing —
+    # which is exactly what it did the first time.
+    local text files=""
+    while IFS= read -r f; do
+        [ -f "$f" ] && files="$files$f\n"
+    done < <(ls -1 "$DIR"/*.md 2>/dev/null | grep -v README | tail -3)
+    [ -n "$files" ] || { printf 'note: nothing to read\n' >&2; exit 0; }
+    text=$(printf '%b' "$files" | while IFS= read -r f; do [ -n "$f" ] && cat "$f"; done \
+        | awk -v n="$n" '
+            /^## /   { seg++; next }
+            /^# /    { next }
+            seg      { buf[seg] = buf[seg] "\n" $0 }
+            END      { for (i = seg - n + 1; i <= seg; i++) if (i > 0) printf "%s ", buf[i] }')
+    text=$(printf '%s' "$text" | tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//')
+    [ -n "${text//[[:space:]]/}" ] || { printf 'note: nothing to read\n' >&2; exit 0; }
+    if [ -x "$SAY" ]; then printf '%s' "$text" | "$SAY"; else printf '%s\n' "$text"; fi
+}
+
+do_edit() {
+    ensure_dir
+    local f; f=$(today_file)
+    [ -f "$f" ] || printf '# %s\n' "$(date '+%A %-d %B %Y')" >"$f"
+    "${EDITOR:-vi}" "$f"
+    commit_quietly
+}
+
+do_sync() {
+    [ -d "$DIR/.git" ] || die "$DIR is not a git repo"
+    commit_quietly
+    git -C "$DIR" remote | grep -q . || die "no remote configured; add one with:
+  git -C $DIR remote add origin <url>"
+    git -C "$DIR" push 2>&1 | tail -3
+}
+
+# Default view: pick an entry, print it. Preview needs the file, so the picker
+# lists files and previews their content.
+do_pick() {
+    [ -d "$DIR" ] || die "no notes yet"
+    command -v fzf >/dev/null || { do_today; return; }
+    local f
+    f=$(ls -1t "$DIR"/*.md 2>/dev/null | grep -v README \
+        | fzf --prompt='note> ' --preview 'cat {}' --preview-window=right:60%) || return 0
+    [ -n "$f" ] && cat "$f"
+}
+
+case "${1:-}" in
+    add)    shift; do_add "$@" ;;
+    today)  do_today ;;
+    search) shift; do_search "$@" ;;
+    read)   shift; do_read "${1:-1}" ;;
+    edit)   do_edit ;;
+    sync)   do_sync ;;
+    '')     do_pick ;;
+    -h|--help|help) sed -n '3,13p' "$0" | sed 's/^# \?//' ;;
+    *)      die "unknown command '$1' (try --help)" ;;
+esac

@@ -14,6 +14,7 @@ is sent anywhere, which also means none of it needs a network.
 | | |
 |---|---|
 | **Dictation into any window** | Tap `$mod+/`, speak, tap again — the transcript types itself wherever the cursor is. `$mod+\` also presses Return, so a dictated prompt submits itself. whisper.cpp locally; a 5.5 s utterance comes back in ~6 s. |
+| **A spoken notebook** | `$mod+n` dictates straight into a dated notes file — no window, no cursor, no editor, and it works on a bare TTY. `note read` speaks recent entries back at you. |
 | **Text to speech** | Select anything, press `$mod+p`, hear it read in a neural voice (piper). `$mod+Shift+p` shuts it up. |
 | **A voice loop with an AI agent** | Dictate a prompt, get a one-line summary spoken back. A Claude Code `Stop` hook plus a convention — the pattern transfers to any agent that can run a command when it finishes. |
 | **Battery time remaining** | The axp20x PMU reports charge but not time left. `bin/battery-remaining` computes it and feeds a prompt segment. |
@@ -127,7 +128,7 @@ checks directive *names* only — a bad *value* like `mode 1280x720` or
 
 | | |
 |---|---|
-| `bin/` | `ptt` (dictation), `say` (piper TTS), `listen` (whisper), `audio`, `wifi`, `backlight`, `battery-remaining` |
+| `bin/` | `ptt` (dictation), `note` (spoken notebook), `say` (piper TTS), `listen` (whisper), `audio`, `wifi`, `backlight`, `battery-remaining` |
 | `sway/` | the device layer — `output`/`input`, rotation, scale, gaps, keybindings |
 | `tty/` | rose-pine VT palette, sway autostart on the tty1 autologin |
 | `udev/` | right Alt → Super, since the board has no Super key |

@@ -257,6 +257,7 @@ Nothing outstanding. `tty/rose-pine-tty.sh` was **confirmed painting on a real V
 | `bin/say` | speaks text aloud via piper. Reads stdin, so anything can pipe into it. `-l` lists voices, `-v` picks one, `-w` renders to WAV, `--stop` interrupts. Bound to `$mod+p` (speak selection) and `$mod+Shift+p` (stop) |
 | `bin/listen` | records and transcribes with whisper.cpp. Records until Enter, or `-d N` seconds. `-f FILE` transcribes an existing wav. `-c` copies to clipboard |
 | `bin/audio` | `status`/`out`/`in`/`vol`/`mute`/`mic`/`test`/`level` for PulseAudio and ALSA, plus an fzf menu with no args |
+| `bin/note` | spoken notebook. `add`/`today`/`search`/`read`/`edit`/`sync`. Bound to `$mod+n`; notes live in `~/notes`, outside this repo |
 | `bin/ptt` | dictation. `toggle [--enter]`/`start`/`stop`/`cancel`/`status`. Bound in `10-uconsole.conf` to `$mod+/` (toggle) and `$mod+\` (toggle, then Return); types the transcript into the focused window |
 
 `wifi` and `ptt` are symlinked into `~/.local/bin`. `battery-remaining` is **not** on
@@ -691,6 +692,49 @@ assumption is that model loading is the fixed cost. It is not: the server was se
 **0.59 s** after launch, so loading is under 10% of it. The rest is the encoder. A
 resident server saves ~1.5 s per utterance and costs a background process holding 75 MB;
 `-ac` beats it several times over for a one-line change.
+
+### `bin/note` — a spoken notebook, on `$mod+n`
+
+Tap `$mod+n`, speak, stop speaking; the transcript is appended to today's file in
+`~/notes`. Added 2026-08-06.
+
+**What earns a third dictation key is that this capture has NO TARGET.** `$mod+/` and
+`$mod+\` type into whatever window has focus, so they need a focused text field. `$mod+n`
+writes to a file, so it works from a blank workspace, over a browser, or **from a bare TTY
+with no compositor running** — `wtype` is never involved. With silence auto-stop that is
+one keypress for a whole thought.
+
+Retrieval can be spoken too, which is the point on a 5" panel: `note read [N]` hands the
+last N entries to `bin/say`. Voice in, voice out.
+
+| | |
+|---|---|
+| `note` | fzf picker over day-files, with preview |
+| `note add "text"` / `note add -` | append; `-` reads stdin, which is how dictation gets in |
+| `note today` / `note search TERM` | print today; ripgrep everything |
+| `note read [N]` | speak the last N entries aloud |
+| `note edit` / `note sync` | `$EDITOR` on today's file; commit and push |
+
+**One file per day, appended**, because the hard part of filing a note by voice is
+*naming* it and a daily file needs no name. Deriving a filename from the first few
+transcribed words sounds clever and yields `2026-08-06-1032-the-thing-about-the.md`.
+
+**The notes are not in this repo and must not be.** The tool is public, the contents are
+not — the same split as `bin/wifi`, which starts and stops daemons but never reads a
+passphrase. `~/notes` is its own private git repo, initialised on first use, and
+`$NOTE_DIR` overrides the location.
+
+**Capture commits but never pushes.** Wifi is off by default here, so a binding that
+blocked on a DNS timeout would feel broken. `note sync` pushes deliberately.
+
+`ptt` grew a **sink** field in its state file for this — `type` or `note` — alongside the
+existing submit flag. It is a fixed set rather than an arbitrary command: the state file
+is space-separated, so smuggling a shell command through it would be fragile, and a
+needless injection surface for something only ever invoked from a keybinding.
+
+Transcription errors matter more here than in a dictated prompt. In a prompt a wrong word
+is visible immediately; in a note you find it in three weeks with no way to reconstruct
+what you meant. Hence `note edit`, and hence the per-entry timestamps.
 
 ### Speech out — `$mod+p`, and the Stop hook
 

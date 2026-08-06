@@ -5,6 +5,7 @@
 #
 #   ptt toggle          tap to start, tap again to stop      ($mod+/)
 #   ptt toggle --enter  the same, then press Return          ($mod+\)
+#   ptt toggle --note   the same, appended to bin/note instead ($mod+n)
 #   ptt start [--enter] begin recording
 #   ptt stop            end, transcribe, type
 #   ptt cancel          throw the recording away without transcribing
@@ -106,6 +107,17 @@ now_ms() { date +%s%3N; }
 # Accepts --enter/-e (or nothing) and echoes 1/0. Kept permissive rather than
 # erroring on an unknown argument: this is invoked from a sway binding, where a
 # non-zero exit is invisible and silence would look like a broken key.
+# Where the transcript goes, as opposed to how it is typed. A fixed set rather
+# than an arbitrary command: the state file is space-separated, so smuggling a
+# shell command through it would be fragile, and a needless injection surface for
+# something only ever invoked from a keybinding.
+want_sink() {
+    case "${1:-}" in
+        --note|note) printf 'note' ;;
+        *)           printf 'type' ;;
+    esac
+}
+
 want_enter() {
     case "${1:-}" in
         --enter|-e|enter|1) printf '1' ;;
@@ -232,9 +244,9 @@ PY
 read_state() {
     [ -f "$STATE" ] || return 1
     local pid wav started
-    read -r pid wav started enter <"$STATE" || return 1
+    read -r pid wav started enter sink <"$STATE" || return 1
     [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] || return 1
-    printf '%s %s %s %s' "$pid" "$wav" "$started" "${enter:-0}"
+    printf '%s %s %s %s %s' "$pid" "$wav" "$started" "${enter:-0}" "${sink:-type}"
 }
 
 # A state file naming a process that no longer exists means the recording ended
@@ -245,7 +257,7 @@ read_state() {
 reap_stale() {
     [ -f "$STATE" ] || return 0
     local pid wav started enter
-    read -r pid wav started enter <"$STATE" 2>/dev/null || { rm -f "$STATE"; return 0; }
+    read -r pid wav started enter sink <"$STATE" 2>/dev/null || { rm -f "$STATE"; return 0; }
     [ -n "${pid:-}" ] && [ -d "/proc/$pid" ] && return 0   # still live, leave alone
     [ -n "${wav:-}" ] && rm -f "$wav"
     rm -f "$STATE"
@@ -259,7 +271,7 @@ do_start() {
     # from whichever key stops the recording — the two presses are separate
     # processes, and "the key I pressed to begin is the one that decides" is the
     # predictable rule. Stopping a $mod+\ recording with $mod+/ still submits.
-    local enter="${1:-0}"
+    local enter="${1:-0}" sink="${2:-type}"
     reap_stale
 
     # A live recording here means the previous key release never arrived — sway
@@ -269,9 +281,9 @@ do_start() {
     # The tempting alternative, ignoring the press, is much worse: it leaves the
     # key dead until arecord hits its own -d ceiling, so one missed release
     # breaks dictation for MAX_SECONDS with no indication why.
-    local orphan opid owav ostarted oenter
+    local orphan opid owav ostarted oenter osink
     if orphan=$(read_state); then
-        read -r opid owav ostarted oenter <<<"$orphan"
+        read -r opid owav ostarted oenter osink <<<"$orphan"
         rm -f "$STATE"
         kill "$opid" 2>/dev/null
         wait "$opid" 2>/dev/null
@@ -294,8 +306,8 @@ do_start() {
     arecord -q -f S16_LE -r 16000 -c 1 -d "$MAX_SECONDS" "$wav" >/dev/null 2>&1 &
     local pid=$!
 
-    printf '%s %s %s %s\n' "$pid" "$wav" "$started" "$enter" >"$STATE"
-    log "start: pid=$pid wav=$wav enter=$enter"
+    printf '%s %s %s %s %s\n' "$pid" "$wav" "$started" "$enter" "$sink" >"$STATE"
+    log "start: pid=$pid wav=$wav enter=$enter sink=$sink"
 
     # Detached, and it shuts itself down when the state file stops naming this
     # recording — so nothing here has to track or kill it.
@@ -307,9 +319,9 @@ do_start() {
 
 do_stop() {
     reap_stale
-    local state pid wav started enter
+    local state pid wav started enter sink
     state=$(read_state) || { log "stop: nothing recording"; rm -f "$STATE"; return 0; }
-    read -r pid wav started enter <<<"$state"
+    read -r pid wav started enter sink <<<"$state"
 
     # Clear the slot BEFORE the slow work, so the next press is free to start.
     rm -f "$STATE"
@@ -363,7 +375,7 @@ do_stop() {
     fi
 
     log "stop: -> $cleaned"
-    emit "$cleaned" "$enter"
+    emit "$cleaned" "$enter" "${sink:-type}"
 }
 
 # Strip whisper's non-speech annotations.
@@ -398,7 +410,21 @@ clean_text() {
 # `--` is mandatory, not defensive: a transcript beginning with a dash would
 # otherwise be parsed as wtype options.
 emit() {
-    local text="$1" enter="${2:-0}"
+    local text="$1" enter="${2:-0}" sink="${3:-type}"
+
+    # A sink other than the window needs no focused text field at all — this
+    # works from a blank workspace, and on a TTY where wtype cannot run.
+    if [ "$sink" = "note" ]; then
+        local n; n="$(dirname "$SELF")/note"
+        if [ -x "$n" ]; then
+            printf '%s' "$1" | "$n" add - >>"$LOG" 2>&1 && return 0
+            log "emit: note add failed"
+        else
+            log "emit: bin/note not found at $n"
+        fi
+        return 1
+    fi
+
     # A trailing space is for chaining utterances; when the line is about to be
     # submitted it is just a stray space before Enter.
     [ "$TRAILING_SPACE" = 1 ] && [ "$enter" != 1 ] && text="$text "
@@ -431,9 +457,9 @@ emit() {
 
 do_cancel() {
     reap_stale
-    local state pid wav started enter
+    local state pid wav started enter sink
     state=$(read_state) || { rm -f "$STATE"; return 0; }
-    read -r pid wav started enter <<<"$state"
+    read -r pid wav started enter sink <<<"$state"
     rm -f "$STATE"
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
@@ -480,9 +506,9 @@ do_level() {
 }
 
 do_status() {
-    local state pid wav started enter
+    local state pid wav started enter sink
     if state=$(read_state); then
-        read -r pid wav started enter <<<"$state"
+        read -r pid wav started enter sink <<<"$state"
         printf 'recording  %ss elapsed  (pid %s)\n' \
             "$(( ( $(now_ms) - started ) / 1000 ))" "$pid"
     else
@@ -491,9 +517,10 @@ do_status() {
 }
 
 case "${1:-}" in
-    start)  do_start "$(want_enter "${2:-}")" ;;
+    start)  do_start "$(want_enter "${2:-}")" "$(want_sink "${2:-}")" ;;
     stop)   do_stop ;;
-    toggle) if read_state >/dev/null; then do_stop; else do_start "$(want_enter "${2:-}")"; fi ;;
+    toggle) if read_state >/dev/null; then do_stop
+            else do_start "$(want_enter "${2:-}")" "$(want_sink "${2:-}")"; fi ;;
     cancel) do_cancel ;;
     status) do_status ;;
     level)  do_level ;;
