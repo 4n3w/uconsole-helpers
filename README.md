@@ -78,7 +78,8 @@ Shorter ones fall permanently behind.
 
 *`-ac N` is the real lever.* Shrinking the encoder's audio context cut a 5 s clip on
 `base.en-q5_1` from **12.9 s to 5.2 s (2.5×)** with an identical transcript — `-bs 1` on
-top gives 3.5×. But **undersizing it is four times SLOWER than not using it**: a 30 s clip
+top gives 3.5×. Confirmed on real dictation, not just the synthesized clips used for the
+timings: a 5.5 s utterance transcribes in ~6 s, roughly real time. But **undersizing it is four times SLOWER than not using it**: a 30 s clip
 forced through `-ac 512` took 101.9 s against 26.1 s and garbled the text, because
 whisper retries low-confidence output through its temperature fallback. Size it from the
 audio duration — 50 frames per second, with headroom — never hardcode it. `bin/listen`

@@ -668,6 +668,15 @@ Beam search is deliberately left at the default of 5. `-bs 1` is a further 1.4×
 but beam search is a genuine accuracy safeguard and this box has already chosen accuracy
 over speed once — see the `tiny.en` reversal above.
 
+**Every figure in the tables above was measured on piper-synthesized speech**, because it
+is repeatable and can be cut to exact lengths. That is a real caveat: synthetic speech is
+cleaner than a human in a room, so it flatters both the timings and the accuracy.
+
+**Confirmed on real speech 2026-08-06.** A 5.46 s dictated utterance through the RØDE
+transcribed in ~6 s at `ac=551`, word-perfect. That is roughly real time, against the
+~13 s the same utterance cost the day before — so the speedup survives contact with an
+actual voice, which is the only test that counted.
+
 #### Two things that sound like fixes and are not
 
 **Chunked transcription does not work.** Transcribing 5-second chunks while you keep
@@ -742,7 +751,8 @@ the same reasoning that stops `bin/wifi` pkilling `wpa_supplicant`.
 ### Dictation — `bin/ptt`, on `$mod+/` and `$mod+\`
 
 Tap `$mod+/`, speak, tap again; `wtype` types the transcript into the focused window.
-Added 2026-08-05, and **confirmed working by dictating with it**.
+Added 2026-08-05 and **confirmed working by dictating with it**; both keys re-confirmed
+on 2026-08-06 after the switch to toggles, including `$mod+\` submitting its own line.
 
 **Two bindings, both toggles, differing only in a trailing Return.** `$mod+/` types the
 transcript and leaves it for you to edit; `$mod+\` types it and presses Return, so a
