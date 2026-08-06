@@ -1,11 +1,31 @@
-# uconsole
+# uconsole-helpers
 
-Device config for the [ClockworkPi uConsole](https://www.clockworkpi.com/uconsole) —
-CM4, Debian bullseye, terminal-first sway with no display manager.
+A voice-driven, terminal-first setup for the
+[ClockworkPi uConsole](https://www.clockworkpi.com/uconsole) — CM4, Debian bullseye,
+sway with no display manager — plus the hardware findings that make it work.
 
-Most of this repo is ordinary dotfile plumbing. The part worth your time if you landed
-here from a search engine is below: things about this board that are **not** in the
-ClockworkPi documentation, each confirmed on the device rather than inferred.
+**Everything runs on the device.** Speech recognition and synthesis are local; nothing
+is sent anywhere, which also means none of it needs a network.
+
+`$mod` below is **right Alt** — the uConsole has no Super key, so a udev rule remaps it.
+
+## What you get
+
+| | |
+|---|---|
+| **Dictation into any window** | Tap `$mod+/`, speak, tap again — the transcript types itself wherever the cursor is. `$mod+\` also presses Return, so a dictated prompt submits itself. whisper.cpp locally; a 5.5 s utterance comes back in ~6 s. |
+| **Text to speech** | Select anything, press `$mod+p`, hear it read in a neural voice (piper). `$mod+Shift+p` shuts it up. |
+| **A voice loop with an AI agent** | Dictate a prompt, get a one-line summary spoken back. A Claude Code `Stop` hook plus a convention — the pattern transfers to any agent that can run a command when it finishes. |
+| **Battery time remaining** | The axp20x PMU reports charge but not time left. `bin/battery-remaining` computes it and feeds a prompt segment. |
+| **Brightness keys that work** | `Fn+<`/`>` are dead out of the box — not broken, just unbound, and they emit from a *different* HID device than you'd expect. |
+| **Wifi without NetworkManager** | `wifi on/off/status/add`, driving `wpa_supplicant` directly. The script never reads, copies or passes your passphrase. |
+| **Audio you can reason about** | `audio status/out/in/level` for a board whose audio is genuinely confusing — including an SNR measurement, because absolute level lies to you. |
+| **A panel that isn't sideways** | Correct rotation in *both* Wayland and the framebuffer console — two independent settings that need the same fix — plus autologin straight into sway on tty1. |
+| **One-command rebuild** | `./install.sh` restores the whole machine from a fresh image, with a `--check` mode that changes nothing. |
+
+Useful even if you want none of that: the findings below are things about this board that
+are **not** in the ClockworkPi documentation, each confirmed on the device rather than
+inferred. Several of them cost an afternoon to discover.
 
 ## Hardware findings
 
@@ -107,7 +127,7 @@ checks directive *names* only — a bad *value* like `mode 1280x720` or
 
 | | |
 |---|---|
-| `bin/` | `ptt` (push-to-talk dictation), `say` (piper TTS), `listen` (whisper), `audio`, `wifi`, `backlight`, `battery-remaining` |
+| `bin/` | `ptt` (dictation), `say` (piper TTS), `listen` (whisper), `audio`, `wifi`, `backlight`, `battery-remaining` |
 | `sway/` | the device layer — `output`/`input`, rotation, scale, gaps, keybindings |
 | `tty/` | rose-pine VT palette, sway autostart on the tty1 autologin |
 | `udev/` | right Alt → Super, since the board has no Super key |
