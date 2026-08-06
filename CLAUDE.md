@@ -727,6 +727,23 @@ passphrase. `~/notes` is its own private git repo, initialised on first use, and
 **Capture commits but never pushes.** Wifi is off by default here, so a binding that
 blocked on a DNS timeout would feel broken. `note sync` pushes deliberately.
 
+`~/notes` has a **private remote of its own**, added by hand:
+
+```bash
+git -C ~/notes remote add origin <your private notes repo>
+git -C ~/notes push -u origin main
+```
+
+**The URL is deliberately not written down here, and should not be.** This repo is
+public, so recording it would leak both the account name and the existence of the private
+one — the very thing the identifier scrub before publication was for. Wired up on
+2026-08-06; `git -C ~/notes remote -v` on the device is the answer.
+
+Consequence for a rebuild: `install.sh` restores the *tool* but cannot restore the
+*notes*, because it cannot know where they live. A fresh image needs that clone by hand,
+which is the same category as `wpa_supplicant.conf` — user data the installer is
+deliberately blind to.
+
 `ptt` grew a **sink** field in its state file for this — `type` or `note` — alongside the
 existing submit flag. It is a fixed set rather than an arbitrary command: the state file
 is space-separated, so smuggling a shell command through it would be fragile, and a
