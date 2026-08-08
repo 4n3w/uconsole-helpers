@@ -642,6 +642,50 @@ file, which is a trap: `ggml-base.en-q5_1` (57 MB) is smaller than `ggml-tiny.en
 while being the larger, slower, more accurate model — so adding a quantized file silently
 changed the default.
 
+#### A LAN whisper server beats every local optimisation put together
+
+`$LISTEN_SERVER` points `bin/listen` at a `whisper-server` elsewhere on the network.
+Measured against a Mac Studio M2 Ultra running **large-v3-turbo** on Metal, *including*
+the wifi round trip:
+
+| audio | remote | local `base.en-q5_1` | |
+|---|---|---|---|
+| 3 s | **0.28 s** | 3.45 s | 12.5× |
+| 5 s | **0.36 s** | 5.09 s | 14.3× |
+| 12 s | **0.52 s** | 14.56 s | 28.3× |
+
+0.04–0.07× real time. And **more accurate as well as faster**, which is the part that
+matters: large-v3-turbo returns "coronal mass ejection" and "heliosphere" where
+`base.en-q5_1` gives "coral mass ejection" — exactly the class of error that made this box
+abandon `tiny.en`. A 12.7 s dictation through `$mod+\` came back in about one second.
+
+Two consequences worth drawing out. **This makes a CM5 upgrade unnecessary for voice** —
+the compute problem moves off the device entirely, and the CM4 is amply able to record a
+wav and post it. And **streaming becomes viable**: chunked transcription died at 1.18×
+real time, and 0.05× is nowhere near that limit.
+
+**The fallback is the point, not a nicety.** Wifi is off by default here and the setup has
+been offline-capable throughout; a remote dependency that turned dictation into an error
+when the LAN is absent would be a bad trade at any speed. If the server does not answer
+within `$LISTEN_SERVER_TIMEOUT` (10 s), the local model runs and the only cost is the wait.
+
+**The address lives in `~/.config/uconsole/voice.conf`, not in this repo and not in
+`~/.profile`.** Three reasons, each learned here: a private LAN address has no business in
+a public repo; login-path exports are subject to the export-above-the-sway-hook ordering
+trap that silently killed `LISTEN_MODEL` for months; and config that matters to one command
+belongs beside that command, where it also takes effect immediately rather than at next
+login. An explicit environment variable still overrides it.
+
+Server side lives in `~/workspace/uconsole-voice` on the Mac — a self-contained CMake, a
+whisper.cpp build with Metal, the model, and `serve.sh start|stop|status`. Nothing was
+installed system-wide. It is started by hand and **will not survive a reboot**; a launchd
+agent would fix that and was deliberately not added without asking.
+
+**Note the LAN is not as fast as it looks.** `ping` showed `min/avg/max/mdev =
+4.4/30.3/182.8/45.3 ms` — `mdev` of 45 ms is the tell, and `iw dev wlan0 get power_save`
+confirms power saving is on, so the radio sleeps between beacons. Irrelevant for a single
+POST, and it would matter a great deal for streaming.
+
 #### `-ac` is the biggest speed lever here, and `bin/listen` sizes it automatically
 
 Whisper's encoder processes a **fixed 30-second window** whatever the clip length, which

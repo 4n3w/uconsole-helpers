@@ -6,6 +6,10 @@
 #   listen -d 8         record a fixed 8 seconds instead
 #   listen -f rec.wav   transcribe an existing file, recording nothing
 #   listen -m tiny.en   pick a model (default: base.en-q5_1, or $LISTEN_MODEL)
+#
+# Set $LISTEN_SERVER to a whisper-server on the LAN and transcription happens
+# there instead — far faster and more accurate — falling back to the local model
+# whenever it cannot be reached.
 #   listen -c           also copy the transcript to the clipboard
 #   listen -k           keep the recording instead of deleting it
 #
@@ -188,6 +192,64 @@ else
     [ -s "$wav" ] || die "listen: nothing was recorded"
 fi
 
+### Remote transcription, with the local model as fallback.
+#
+# $LISTEN_SERVER points at a whisper-server on the LAN. Measured against a Mac
+# Studio M2 Ultra running large-v3-turbo on Metal, including the wifi round trip:
+#
+#     audio    remote     local (base.en-q5_1)
+#     3 s      0.28 s     3.45 s
+#     5 s      0.36 s     5.09 s
+#     12 s     0.52 s     14.56 s
+#
+# 0.04-0.07x real time, so 12-28x faster — AND more accurate, because a machine
+# with 192 GB can afford large-v3-turbo. It transcribes "coronal mass ejection"
+# and "heliosphere" where base.en-q5_1 gives "coral mass ejection", which is
+# precisely the class of error that made this box abandon tiny.en.
+#
+# THE FALLBACK IS THE POINT, not a nicety. Wifi is off by default here and the
+# whole setup has been offline-capable from the start; a remote dependency that
+# turned dictation into an error when the LAN is absent would be a bad trade for
+# any amount of speed. If the server does not answer within the timeout, the
+# local model runs and the only cost is the wait.
+#
+# Empty LISTEN_SERVER disables this entirely.
+# Machine-local settings, chiefly the LAN server's address. A config file rather
+# than ~/.profile for three reasons: a private address has no business in a public
+# repo; login-path exports are subject to the export-above-the-sway-hook ordering
+# trap that already silently killed LISTEN_MODEL once; and config that matters to
+# exactly one command belongs beside that command, where it also takes effect
+# immediately instead of at next login.
+#
+# An explicit environment variable still wins, so one-off overrides work.
+_env_server="${LISTEN_SERVER:-}"
+VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
+[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+[ -n "$_env_server" ] && LISTEN_SERVER="$_env_server"
+LISTEN_SERVER="${LISTEN_SERVER:-}"
+LISTEN_SERVER_TIMEOUT="${LISTEN_SERVER_TIMEOUT:-10}"
+
+transcribe_remote() {   # wav -> text on stdout; non-zero if unusable
+    [ -n "$LISTEN_SERVER" ] || return 1
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -sf --max-time "$LISTEN_SERVER_TIMEOUT" \
+        -F "file=@$1" -F "response_format=text" \
+        "${LISTEN_SERVER%/}/inference" 2>/dev/null \
+        | tr -d '\r' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
+        | grep -v '^$' | paste -sd' ' -
+}
+
+text=""
+if [ -n "$LISTEN_SERVER" ]; then
+    printf '  transcribing (remote: %s)...\n' "$LISTEN_SERVER" >&2
+    text=$(transcribe_remote "$wav")
+    [ -z "${text//[[:space:]]/}" ] && {
+        printf '  remote unavailable — falling back to the local model\n' >&2
+        text=""
+    }
+fi
+
+if [ -z "$text" ]; then
 AC=$(audio_ctx_for "$wav")
 AC_ARGS=""
 [ -n "${AC:-}" ] && AC_ARGS="-ac $AC"
@@ -201,6 +263,7 @@ printf '  transcribing (%s%s)...\n' "$(basename "$MODEL")" \
 # "plaid mode". One clean test sentence is not enough evidence to give it up.
 text=$("$BIN" -m "$MODEL" -f "$wav" -l en -nt -np $AC_ARGS 2>/dev/null | tr -d '\r' \
         | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | paste -sd' ' -)
+fi
 
 [ -n "${text:-}" ] || die "listen: no speech recognised"
 printf '%s\n' "$text"
