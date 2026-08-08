@@ -1054,8 +1054,19 @@ This mattered more under the old hold binding, where sway could drop a `--releas
 focus changed mid-hold, but it is still the right behaviour: ignoring the press instead
 would leave the key dead until `arecord` hits its own `-d` ceiling.
 
-**Recording auto-stops after 3 s of quiet**, so the second tap is only needed to cut
-yourself off early. `bin/ptt-silence-watch.py` is spawned detached by `start`, polls the
+**Recording auto-stops after a pause, and the length depends on the key**, so the second
+tap is only needed to cut yourself off early.
+
+| key | window | why |
+|---|---|---|
+| `$mod+/` | **2 s** | leaves the transcript in front of you — a premature stop costs a glance and a redo |
+| `$mod+\` | **3 s** | presses Return, so a premature stop does not truncate, it *submits* the truncated half |
+| `$mod+n` | **3 s** | files it in the notebook, where a lost clause goes unnoticed until triage |
+
+The asymmetry runs the same way every time: **too long only makes you wait, too short
+destroys something.** Against a ~1.75 s natural mid-sentence pause, 2 s leaves 0.25 s of
+margin and 3 s leaves 1.25 s. `$PTT_SILENCE_SECS` and `$PTT_SILENCE_SECS_COMMIT` override
+them. `bin/ptt-silence-watch.py` is spawned detached by `start`, polls the
 growing wav, and runs `ptt stop` when it falls quiet. It exits on its own once the state
 file stops naming that recording, so a manual toggle, a cancel or an orphan recovery all
 end it without its pid being tracked. `PTT_SILENCE_SECS=0` restores pure toggling.

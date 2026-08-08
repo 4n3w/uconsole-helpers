@@ -10,8 +10,8 @@
 #   ptt stop            end, transcribe, type
 #   ptt cancel          throw the recording away without transcribing
 #
-# Recording also stops on its own after $PTT_SILENCE_SECS of quiet (default 3),
-# so in practice the second tap is only needed to cut yourself off early.
+# Recording stops on its own after a pause: 2s for $mod+/, 3s for the keys that
+# submit or file the text, where a truncation costs more. Tap again to stop early.
 #   ptt status          print whether a recording is live
 #   ptt level           live mic level, for checking the silence threshold
 #
@@ -94,7 +94,20 @@ SILENCE_DBFS="${PTT_SILENCE_DBFS:--70}"
 # above — that one refuses to transcribe at all and had to be near-unmissable,
 # because its false positive silently discards real dictation. This one is
 # always recoverable, because the manual toggle never goes away.
-SILENCE_SECS="${PTT_SILENCE_SECS:-3}"
+# TWO WINDOWS, chosen by whether a premature stop is recoverable.
+#
+# $mod+/ leaves the transcript in the focused window for you to read, so being
+# cut off costs a glance and a redo — it can afford to be snappy. $mod+\ presses
+# Return, so a premature stop does not merely truncate, it SUBMITS the truncated
+# half. $mod+n files the text into the notebook, where a lost clause goes
+# unnoticed until triage, possibly weeks later.
+#
+# The asymmetry runs the same way both times: too long only makes you wait, too
+# short destroys something. So the recoverable path gets 2s and every committed
+# path gets 3s. Against a ~1.75s natural mid-sentence pause that is 0.25s of
+# margin versus 1.25s.
+SILENCE_SECS="${PTT_SILENCE_SECS:-2}"
+SILENCE_SECS_COMMIT="${PTT_SILENCE_SECS_COMMIT:-3}"
 # "auto" tracks the room's own noise floor; a number pins it absolutely.
 SILENCE_END_DBFS="${PTT_SILENCE_END_DBFS:-auto}"
 # dB above the quietest block seen, when auto.
@@ -316,13 +329,17 @@ do_start() {
     local pid=$!
 
     printf '%s %s %s %s %s\n' "$pid" "$wav" "$started" "$enter" "$sink" >"$STATE"
-    log "start: pid=$pid wav=$wav enter=$enter sink=$sink"
+    local win="$SILENCE_SECS"
+    if [ "$enter" = "1" ] || [ "$sink" != "type" ]; then
+        win="$SILENCE_SECS_COMMIT"
+    fi
+    log "start: pid=$pid wav=$wav enter=$enter sink=$sink win=${win}s"
 
     # Detached, and it shuts itself down when the state file stops naming this
     # recording — so nothing here has to track or kill it.
-    if [ "$SILENCE_SECS" != "0" ] && [ -x "$WATCHER" ]; then
+    if [ "$win" != "0" ] && [ -x "$WATCHER" ]; then
         setsid "$WATCHER" "$wav" "$STATE" "$SELF" \
-            "$SILENCE_SECS" "$SILENCE_END_DBFS" "$LOG" "$SILENCE_MARGIN_DB" \
+            "$win" "$SILENCE_END_DBFS" "$LOG" "$SILENCE_MARGIN_DB" \
             >/dev/null 2>&1 &
     fi
 }
