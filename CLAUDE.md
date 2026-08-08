@@ -692,7 +692,28 @@ whisper.cpp build with Metal, the model, and `serve.sh start|stop|status`. Nothi
 installed system-wide. It is started by hand and **will not survive a reboot**; a launchd
 agent would fix that and was deliberately not added without asking.
 
-**Note the LAN is not as fast as it looks.** `ping` showed `min/avg/max/mdev =
+**Wifi power save is disabled by `wifi on`, and it matters more than it sounds.** Twelve
+identical transcription requests each way:
+
+| | power save on | off |
+|---|---|---|
+| median | 552 ms | **414 ms** |
+| **max** | **2480 ms** | **483 ms** |
+| spread | 6.6× | 1.3× |
+| packet loss | **8%** | 0% |
+| ping mdev | 73 ms | 19 ms |
+
+The max is the number that matters. The radio sleeps between beacons, and a request
+landing in a sleep window waits it out — which presents as "sometimes slow for no
+reason" rather than as a network fault, and is exactly how it was noticed. It resets on
+every interface bring-up, so `bin/wifi` sets it each time rather than relying on a
+one-off command. `WIFI_POWER_SAVE=on` restores the default.
+
+The battery cost is **unmeasured** — the device was on AC when this was tested, where
+`current_now` reads ~0 because it reports battery current. Worth measuring unplugged
+before assuming it is free.
+
+**Historical note.** `ping` showed `min/avg/max/mdev =
 4.4/30.3/182.8/45.3 ms` — `mdev` of 45 ms is the tell, and `iw dev wlan0 get power_save`
 confirms power saving is on, so the radio sleeps between beacons. Irrelevant for a single
 POST, and it would matter a great deal for streaming.

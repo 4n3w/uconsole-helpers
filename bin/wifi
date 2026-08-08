@@ -60,6 +60,24 @@ do_on() {
         || die "wifi: wpa_supplicant failed to start"
     sleep 6
     sudo dhclient -1 -pf "$DH_PID" "$IFACE" || die "wifi: no DHCP lease"
+
+    # Power save costs far more than it saves for anything interactive over the
+    # LAN. Measured against the whisper server on this network, 12 identical
+    # requests each way:
+    #
+    #     power save on    median 552 ms, max 2480 ms, 6.6x spread, 8% packet loss
+    #     power save off   median 414 ms, max  483 ms, 1.3x spread, 0% packet loss
+    #
+    # The max is the number that matters — the radio sleeps between beacons and a
+    # request that lands in a sleep window waits it out. It reads as "sometimes
+    # slow for no reason", which is exactly how it was first noticed.
+    #
+    # Resets on every interface bring-up, hence doing it here rather than once by
+    # hand. Set WIFI_POWER_SAVE=on to keep the default behaviour.
+    if [ "${WIFI_POWER_SAVE:-off}" = "off" ]; then
+        sudo iw dev "$IFACE" set power_save off 2>/dev/null \
+            && printf '  power save off (lower and steadier latency)\n' >&2
+    fi
     printf '\n'; do_status
 }
 
