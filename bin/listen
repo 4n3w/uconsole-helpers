@@ -4,6 +4,7 @@
 #
 #   listen              record until you press Enter, then print the transcript
 #   listen -d 8         record a fixed 8 seconds instead
+#   listen -s           record until you stop talking (for bin/converse)
 #   listen -f rec.wav   transcribe an existing file, recording nothing
 #   listen -m tiny.en   pick a model (default: base.en-q5_1, or $LISTEN_MODEL)
 #
@@ -56,10 +57,11 @@ find_bin() {
     return 1
 }
 
-duration=""; model=""; copy=0; keep=0; infile=""
+duration=""; model=""; copy=0; keep=0; infile=""; silence=0
 while [ $# -gt 0 ]; do
     case "$1" in
         -d|--duration) duration="${2:-}"; shift 2 || die "listen: -d needs seconds" ;;
+        -s|--until-silence) silence=1; shift ;;
         -f|--file)     infile="${2:-}";   shift 2 || die "listen: -f needs a path" ;;
         -m|--model)    model="${2:-}";    shift 2 || die "listen: -m needs a model" ;;
         -c|--copy)     copy=1; shift ;;
@@ -177,7 +179,17 @@ else
     trap cleanup EXIT INT TERM
 
     # 16 kHz mono, signed 16-bit — exactly what whisper.cpp wants.
-    if [ -n "$duration" ]; then
+    if [ "$silence" = 1 ]; then
+        # Same detection bin/ptt uses, via the same helper — a second
+        # implementation of "have they stopped talking" would drift from it.
+        printf '  listening — speak, then stop\n' >&2
+        arecord -q -f S16_LE -r 16000 -c 1 -d 120 "$wav" 2>/dev/null &
+        rec_pid=$!
+        python3 "$(dirname "$(readlink -f "$0")")/ptt-silence-watch.py" --wait "$wav" \
+            "${LISTEN_SILENCE_SECS:-2}" "${PTT_SILENCE_END_DBFS:-auto}" \
+            "${PTT_SILENCE_MARGIN_DB:-12}" 2>/dev/null
+        kill "$rec_pid" 2>/dev/null; wait "$rec_pid" 2>/dev/null
+    elif [ -n "$duration" ]; then
         printf '  recording %ss — speak now\n' "$duration" >&2
         arecord -q -f S16_LE -r 16000 -c 1 -d "$duration" "$wav" 2>/dev/null
     else

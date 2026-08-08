@@ -1,0 +1,181 @@
+#!/usr/bin/env bash
+#
+# converse — talk to a local language model, out loud.
+#
+#   converse                 start a spoken conversation
+#   converse "opening line"  start with something already said
+#   converse -1 "question"   one exchange, then exit
+#   converse -t              text in, speech out (type instead of talking)
+#
+# Speak, stop speaking, hear the answer. Ctrl-C ends it.
+#
+# WHAT MAKES THIS FEEL LIVE RATHER THAN CORRECT
+#
+# The obvious build — `listen | llm | say` — works and feels terrible, because
+# `say` cannot start until the whole answer exists. A 200-word reply is a long
+# silence followed by a monologue.
+#
+# So this consumes the token stream and speaks at SENTENCE BOUNDARIES: the first
+# sentence goes to piper while the second is still being generated. Perceived
+# latency becomes time-to-first-sentence, roughly a second, rather than
+# time-to-full-response. That is the entire difference between the two
+# experiences and it is most of why this script exists instead of a one-line
+# pipeline.
+#
+# NOTHING HERE IS CLAUDE CODE. It is a plain client against an OpenAI-shaped
+# /v1/chat/completions endpoint, so llama-server, Ollama, vLLM or anything else
+# speaking that dialect will do.
+#
+# EVERYTHING RUNS ON THE LAN. Transcription goes to the whisper server, tokens
+# come from the model server, and speech is synthesised locally by piper. No
+# audio and no text leaves the network.
+
+set -uo pipefail
+
+HERE="$(dirname "$(readlink -f "$0")")"
+LISTEN="$HERE/listen"
+SAY="$HERE/say"
+
+# Shared machine-local config: the whisper server lives here too.
+VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
+[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+
+CHAT_SERVER="${CHAT_SERVER:-}"
+CHAT_MODEL="${CHAT_MODEL:-local}"
+# Kept short deliberately. A model that answers in three sentences feels like a
+# conversation; one that answers in three paragraphs is a lecture you cannot
+# skim, because speech has no skimming.
+CHAT_SYSTEM="${CHAT_SYSTEM:-You are a concise spoken assistant. Reply in at most three short sentences. Never use markdown, lists, code blocks or emoji — everything you say is read aloud.}"
+CHAT_MAX_TOKENS="${CHAT_MAX_TOKENS:-300}"
+CHAT_TURNS="${CHAT_TURNS:-12}"      # exchanges of history kept
+
+die() { printf 'converse: %s\n' "$*" >&2; exit 1; }
+
+one_shot=0; text_mode=0; opening=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -1|--once)  one_shot=1; shift ;;
+        -t|--text)  text_mode=1; shift ;;
+        -h|--help)  sed -n '3,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*)         die "unknown option $1" ;;
+        *)          opening="$*"; break ;;
+    esac
+done
+
+[ -n "$CHAT_SERVER" ] || die "set CHAT_SERVER in $VOICE_CONF (e.g. http://host:8080)"
+command -v curl >/dev/null || die "curl not found"
+[ -x "$LISTEN" ] || die "bin/listen not found"
+
+HIST="$(mktemp)"; : >"$HIST"
+trap 'rm -f "$HIST"; "$SAY" --stop 2>/dev/null; exit 0' EXIT INT TERM
+
+# One exchange. Reads the reply as a token stream and hands piper each sentence
+# as it completes, rather than waiting for the whole thing.
+exchange() {
+    local user="$1"
+    python3 - "$CHAT_SERVER" "$CHAT_MODEL" "$CHAT_SYSTEM" "$HIST" "$user" \
+             "$SAY" "$CHAT_MAX_TOKENS" "$CHAT_TURNS" <<'PY'
+import json, os, re, subprocess, sys, urllib.request
+
+server, model, system, hist_path, user, say, maxtok, turns = sys.argv[1:9]
+maxtok, turns = int(maxtok), int(turns)
+
+history = []
+if os.path.exists(hist_path):
+    try:
+        history = json.load(open(hist_path))
+    except Exception:
+        history = []
+
+messages = [{"role": "system", "content": system}] + history[-turns * 2:] + \
+           [{"role": "user", "content": user}]
+
+req = urllib.request.Request(
+    server.rstrip("/") + "/v1/chat/completions",
+    data=json.dumps({"model": model, "messages": messages, "stream": True,
+                     "max_tokens": maxtok, "temperature": 0.7}).encode(),
+    headers={"Content-Type": "application/json"})
+
+# Speak on sentence boundaries. A boundary is punctuation followed by a space or
+# end of stream — checking for punctuation alone would split "3.5" and "Dr." into
+# separate utterances mid-number and mid-title.
+BOUNDARY = re.compile(r"(?<=[.!?])\s")
+BAD = re.compile(r"[*_`#]+")          # markdown that piper would read aloud
+
+proc = None
+def speak(text):
+    global proc
+    text = BAD.sub("", text).strip()
+    if not text:
+        return
+    if proc is not None:
+        proc.wait()                    # keep utterances in order
+    proc = subprocess.Popen([say, text], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+buf, full = "", ""
+try:
+    with urllib.request.urlopen(req, timeout=120) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == "[DONE]":
+                break
+            try:
+                delta = json.loads(payload)["choices"][0]["delta"].get("content", "")
+            except Exception:
+                continue
+            if not delta:
+                continue
+            sys.stdout.write(delta); sys.stdout.flush()
+            buf += delta; full += delta
+            # Emit every complete sentence sitting in the buffer.
+            while True:
+                m = BOUNDARY.search(buf)
+                if not m:
+                    break
+                speak(buf[:m.end()])
+                buf = buf[m.end():]
+except Exception as exc:
+    print("\n  [%s]" % exc, file=sys.stderr)
+
+if buf.strip():
+    speak(buf)
+if proc is not None:
+    proc.wait()
+print()
+
+history += [{"role": "user", "content": user},
+            {"role": "assistant", "content": full}]
+json.dump(history[-turns * 2:], open(hist_path, "w"))
+PY
+}
+
+capture() {
+    if [ "$text_mode" = 1 ]; then
+        local line
+        IFS= read -r -e -p '  you> ' line || return 1
+        printf '%s' "$line"
+    else
+        "$LISTEN" -s 2>/dev/null
+    fi
+}
+
+printf '  talking to %s (%s). Ctrl-C to stop.\n\n' "$CHAT_SERVER" "$CHAT_MODEL" >&2
+
+if [ -n "$opening" ]; then
+    printf '  you> %s\n  ' "$opening"
+    exchange "$opening"
+    [ "$one_shot" = 1 ] && exit 0
+fi
+
+while :; do
+    said=$(capture) || break
+    [ -n "${said//[[:space:]]/}" ] || { printf '  (nothing heard)\n' >&2; continue; }
+    [ "$text_mode" = 1 ] || printf '  you> %s\n' "$said"
+    printf '  '
+    exchange "$said"
+    [ "$one_shot" = 1 ] && break
+done

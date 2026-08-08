@@ -770,6 +770,47 @@ assumption is that model loading is the fixed cost. It is not: the server was se
 resident server saves ~1.5 s per utterance and costs a background process holding 75 MB;
 `-ac` beats it several times over for a one-line change.
 
+### `bin/converse` — spoken conversation with a local model
+
+`converse` talks to an OpenAI-shaped `/v1/chat/completions` endpoint on the LAN. Nothing
+about it is Claude Code; `llama-server`, Ollama or anything speaking that dialect will do.
+Everything stays on the network — whisper transcribes on the Mac, tokens come from the
+model server, piper synthesises locally.
+
+Measured against `llama-server` with **Qwen2.5-7B-Instruct Q4_K_M** on an M2 Ultra:
+
+| | |
+|---|---|
+| first token | **0.34 s** |
+| full 31-token reply | 0.65 s (48 tok/s) |
+| **first audible speech** | **1.04 s** |
+
+**Sentence-boundary streaming is the whole trick.** The obvious build — `listen \| llm \|
+say` — works and feels terrible, because `say` cannot begin until the entire answer
+exists, so a 200-word reply is a long silence followed by a monologue. `converse` consumes
+the token stream and hands piper each sentence as it completes, so the first is spoken
+while the second is still generating. Perceived latency becomes time-to-first-*sentence*.
+
+The boundary is punctuation followed by whitespace, not punctuation alone — otherwise
+"3.5" and "Dr." split mid-number and mid-title.
+
+**A small model was the right first choice.** For conversation, *time to first token*
+dominates perceived quality: something that starts talking in 0.34 s feels far better
+than a cleverer model that pauses two seconds. Swapping models later changes nothing but
+a path in `serve.sh`.
+
+**The system prompt caps replies at three sentences and forbids markdown**, because speech
+has no skimming — a spoken paragraph cannot be skipped the way a written one can — and
+piper reads asterisks and backticks aloud.
+
+`bin/listen -s` records until you stop talking, using **the same** detection helper as
+`bin/ptt` rather than a second implementation that would drift from it.
+
+**Caveat: the voice path is verified only in pieces.** `--wait` was proven against a
+controlled feed and the streaming against typed input; loudspeaker playback could not test
+the whole loop, because it produces about 11 dB of dynamic range where the detector needs
+12 and real speech gives 30. Worth a real conversation before trusting it.
+
 ### `bin/note` — a spoken notebook, on `$mod+n`
 
 Tap `$mod+n`, speak, stop speaking; the transcript is appended to today's file in

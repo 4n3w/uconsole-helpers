@@ -151,6 +151,7 @@ do_links() {
     link "$HOME/uconsole/bin/wifi"              "$HOME/.local/bin/wifi"
     link "$HOME/uconsole/bin/ptt"               "$HOME/.local/bin/ptt"
     link "$HOME/uconsole/bin/note"              "$HOME/.local/bin/note"
+    link "$HOME/uconsole/bin/converse"          "$HOME/.local/bin/converse"
 
     section "~/.profile hooks"
     # Order matters: the palette first, sway second — the palette is what you are

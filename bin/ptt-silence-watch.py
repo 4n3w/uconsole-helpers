@@ -45,6 +45,14 @@ def main():
     # and because loudspeaker playback turned out to be a poor stand-in for a
     # voice at the mic — it barely cleared the threshold, which invalidated a
     # test rather than the code.
+    # --wait WAV WINDOW THRESH MARGIN: block until the recording falls quiet,
+    # then exit. No state file and no command run — the caller owns the recorder
+    # and decides what to do. bin/listen uses this so conversational capture gets
+    # the same detection as bin/ptt instead of a second implementation that
+    # drifts.
+    if sys.argv[1] == "--wait":
+        return wait_for_silence(sys.argv[2], float(sys.argv[3]),
+                                sys.argv[4], float(sys.argv[5]))
     if sys.argv[1] == "--trace":
         wav, window, thresh = sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
         globals()["wav"] = wav
@@ -179,6 +187,26 @@ def main():
         except Exception as exc:
             note("auto-stop: could not invoke ptt stop: %s" % exc)
         break
+    return 0
+
+
+def wait_for_silence(wav, window, thresh_arg, margin):
+    fixed = None if thresh_arg == "auto" else float(thresh_arg)
+    heard = False
+    floor = peak = None
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        time.sleep(POLL_S)
+        level = _peak(wav, window)
+        if level is None:
+            continue
+        floor = level if floor is None else min(floor, level)
+        peak = level if peak is None else max(peak, level)
+        thresh = fixed if fixed is not None else floor + margin
+        if not heard and (peak - floor) > margin:
+            heard = True
+        if level <= thresh and heard:
+            return 0
     return 0
 
 
