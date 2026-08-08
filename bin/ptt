@@ -59,6 +59,12 @@
 
 set -uo pipefail
 
+# Same machine-local config bin/listen reads — the LAN server address, and any
+# of the thresholds below. Sourced here too, since a setting you can only change
+# for half the voice stack is worse than no setting at all.
+VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
+[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+
 RUN="${XDG_RUNTIME_DIR:-/tmp}/ptt"
 STATE="$RUN/recording"
 LOG="$RUN/ptt.log"
@@ -89,7 +95,10 @@ SILENCE_DBFS="${PTT_SILENCE_DBFS:--70}"
 # because its false positive silently discards real dictation. This one is
 # always recoverable, because the manual toggle never goes away.
 SILENCE_SECS="${PTT_SILENCE_SECS:-3}"
-SILENCE_END_DBFS="${PTT_SILENCE_END_DBFS:--40}"
+# "auto" tracks the room's own noise floor; a number pins it absolutely.
+SILENCE_END_DBFS="${PTT_SILENCE_END_DBFS:-auto}"
+# dB above the quietest block seen, when auto.
+SILENCE_MARGIN_DB="${PTT_SILENCE_MARGIN_DB:-12}"
 
 SELF="$(readlink -f "$0")"
 WATCHER="$(dirname "$SELF")/ptt-silence-watch.py"
@@ -313,7 +322,8 @@ do_start() {
     # recording — so nothing here has to track or kill it.
     if [ "$SILENCE_SECS" != "0" ] && [ -x "$WATCHER" ]; then
         setsid "$WATCHER" "$wav" "$STATE" "$SELF" \
-            "$SILENCE_SECS" "$SILENCE_END_DBFS" "$LOG" >/dev/null 2>&1 &
+            "$SILENCE_SECS" "$SILENCE_END_DBFS" "$LOG" "$SILENCE_MARGIN_DB" \
+            >/dev/null 2>&1 &
     fi
 }
 

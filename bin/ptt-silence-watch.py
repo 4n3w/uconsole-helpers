@@ -49,10 +49,18 @@ def main():
         wav, window, thresh = sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
         globals()["wav"] = wav
         return trace(wav, window, thresh)
-    if len(sys.argv) != 7:
+    # 7 args, or 8 with the margin. This said `!= 7` after the margin was added,
+    # so every invocation returned instantly and auto-stop silently stopped
+    # working — no error, no log line, just nothing. The kind of failure that
+    # looks like the algorithm being wrong.
+    if len(sys.argv) not in (7, 8):
         return 0
     wav, state, ptt = sys.argv[1], sys.argv[2], sys.argv[3]
-    window, thresh, logfile = float(sys.argv[4]), float(sys.argv[5]), sys.argv[6]
+    window, logfile = float(sys.argv[4]), sys.argv[6]
+    # "auto" tracks the room; a number pins it.
+    thresh_arg = sys.argv[5]
+    margin = float(sys.argv[7]) if len(sys.argv) > 7 else 12.0
+    fixed = None if thresh_arg == "auto" else float(thresh_arg)
 
     def note(msg):
         try:
@@ -113,19 +121,53 @@ def main():
         except OSError:
             return False
 
+    # ADAPTIVE BY DEFAULT, because a fixed threshold here was balanced on a knife
+    # edge. Measured over 30 half-second blocks of one silent room: quietest
+    # -49.1, median -46.2, LOUDEST -40.3 dBFS — against a threshold of -40.0.
+    # A 0.3 dB margin, which is why every auto-stop landed at -40.1 or -40.2, and
+    # why lowering the number would have stopped it firing entirely.
+    #
+    # The floor also moves: 9 dB of spread within one room, and a different mic
+    # or a window open shifts all of it. So track the quietest block seen and set
+    # the threshold a margin above it. The running minimum converges on the true
+    # floor within a few seconds and cannot be fooled by speech arriving first,
+    # since any later quiet block pulls it down.
+    #
+    # 12 dB by default: floor -49 puts the threshold at -37, comfortably above
+    # that room's -40.3 worst case and far below speech at roughly -22.
+    # "Has anything been said" is decided by DYNAMIC RANGE, not by the same moving
+    # threshold, and that distinction is load-bearing. The first version tested
+    # `level > floor + margin`, which deadlocks when speech arrives before any
+    # silence: the floor initialises to the speech level, the threshold lands
+    # above it, nothing is ever marked heard, and auto-stop can never fire. It
+    # failed exactly that way on the first live test.
+    #
+    # Tracking the peak as well as the floor fixes it. A recording containing
+    # speech shows a wide spread — floor near -49, peak near -22 — while a silent
+    # room stays within a few dB of itself. So `peak - floor > margin` means
+    # something was said, regardless of what order it arrived in, and a room that
+    # is merely noisy never trips it.
     heard = False
+    floor = None
+    peak = None
     while still_ours():
         time.sleep(POLL_S)
         level = trailing_peak_block(window)
         if level is None:
             continue
-        if level > thresh:
+        floor = level if floor is None else min(floor, level)
+        peak = level if peak is None else max(peak, level)
+        thresh = fixed if fixed is not None else floor + margin
+        if not heard and (peak - floor) > margin:
             heard = True
+        if level > thresh:
             continue
         if not heard:
             continue
         note("auto-stop: loudest 0.5s block in the last %.1fs was %.1f dBFS, "
-             "below %.1f" % (window, level, thresh))
+             "below %.1f%s" % (window, level, thresh,
+                               "" if fixed is not None
+                               else " (floor %.1f + %.0f)" % (floor, margin)))
         try:
             subprocess.Popen(
                 [ptt, "stop"],

@@ -669,6 +669,17 @@ been offline-capable throughout; a remote dependency that turned dictation into 
 when the LAN is absent would be a bad trade at any speed. If the server does not answer
 within `$LISTEN_SERVER_TIMEOUT` (10 s), the local model runs and the only cost is the wait.
 
+**Where the configuration lives, in two halves.** The split is "does it contain anything
+private, and does it differ per machine":
+
+| | where | tracked? |
+|---|---|---|
+| server address, thresholds | `~/.config/uconsole/voice.conf` | **no** — private LAN address, machine-local |
+| how to build and run the server | `server/` in this repo | yes — no secrets, and it makes the system reproducible |
+
+`bin/listen` **and** `bin/ptt` both source `voice.conf`, which matters: a setting you can
+only change for half the voice stack is worse than no setting at all.
+
 **The address lives in `~/.config/uconsole/voice.conf`, not in this repo and not in
 `~/.profile`.** Three reasons, each learned here: a private LAN address has no business in
 a public repo; login-path exports are subject to the export-above-the-sway-hook ordering
@@ -1063,11 +1074,24 @@ test then passed with 4.1 dB of margin instead of 0.3.
 This is the mirror of the peak-versus-SNR lesson under `bin/audio level`: averaging hides
 brief loud events, peak hides brief quiet ones, and neither one is "the level".
 
-Measured here with a loudspeaker standing in for a voice — speech **−22 to −27 dBFS**,
-room silence **−42 to −48**, with transients around −37. The −40 default sits in that
-gap. **The threshold errs low deliberately**: too high and quiet speech reads as silence
-and cuts you off, too low and it simply never fires and you tap twice as before. One
-failure is disruptive, the other invisible.
+**The threshold is adaptive, and a fixed one was a knife edge.** Measured over 30
+half-second blocks of one silent room: quietest −49.1, median −46.2, **loudest −40.3**
+dBFS — against a hardcoded threshold of −40.0. A **0.3 dB** margin, which is why every
+auto-stop landed at −40.1 or −40.2, and why the instinct to *lower* it would have stopped
+auto-stop firing entirely. The floor also spreads 9 dB within one room, and a different
+mic moves all of it.
+
+So the watcher tracks the quietest block it has seen and sets the threshold
+`$PTT_SILENCE_MARGIN_DB` above it (12 dB). On that room: floor −49 puts the threshold at
+−37, comfortably clear of the −40.3 worst case and far below speech at roughly −22.
+Setting `$PTT_SILENCE_END_DBFS` to a number pins it absolutely instead.
+
+**"Has anything been said" is decided by dynamic range, not by that same moving
+threshold**, and the distinction is load-bearing. Testing `level > floor + margin`
+deadlocks when speech arrives before any silence: the floor initialises to the speech
+level, the threshold lands above it, nothing is ever marked heard, and auto-stop can
+never fire. Tracking the peak as well fixes it — a recording with speech spans floor −49
+to peak −22, while a merely noisy room stays within a few dB of itself.
 
 `ptt level` prints a live meter for setting it from your own room and voice, because a
 threshold measured in someone else's is worthless — and because loudspeaker playback
