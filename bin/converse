@@ -36,11 +36,15 @@ set -uo pipefail
 
 HERE="$(dirname "$(readlink -f "$0")")"
 LISTEN="$HERE/listen"
-SAY="${CONVERSE_SAY:-$HERE/say}"   # /usr/bin/say on a Mac
 
-# Shared machine-local config: the whisper server lives here too.
+# Shared machine-local config: the whisper server lives here too. Sourced BEFORE
+# $SAY is resolved, so CONVERSE_SAY can be set in the file rather than exported
+# on every invocation.
+_env_say="${CONVERSE_SAY:-}"
 VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
 [ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+[ -n "$_env_say" ] && CONVERSE_SAY="$_env_say"
+SAY="${CONVERSE_SAY:-$HERE/say}"   # /usr/bin/say on a Mac
 
 CHAT_SERVER="${CHAT_SERVER:-}"
 CHAT_MODEL="${CHAT_MODEL:-local}"

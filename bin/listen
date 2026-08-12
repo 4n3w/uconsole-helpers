@@ -73,6 +73,28 @@ done
 
 [ -n "$infile" ] && [ -n "$duration" ] && die "listen: -f and -d are mutually exclusive"
 
+### Machine-local config.
+#
+# LOADED HERE, BEFORE ANYTHING READS A SETTING. It used to be sourced down beside
+# the remote-transcription code, which is *after* the model is resolved and after
+# the recording is made — so LISTEN_MODEL and LISTEN_AUDIODEV set in this file
+# were silently dead, and only LISTEN_SERVER, used further down still, worked.
+# Config that loads after its first use is worse than no config at all: it looks
+# set and does nothing. Exactly the trap that killed LISTEN_MODEL in ~/.profile.
+#
+# An explicit environment variable still wins, so one-off overrides work — the
+# file uses plain assignments, so sourcing it would otherwise clobber them.
+_env_server="${LISTEN_SERVER:-}"
+_env_model="${LISTEN_MODEL:-}"
+_env_dev="${LISTEN_AUDIODEV:-}"
+VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
+[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+[ -n "$_env_server" ] && LISTEN_SERVER="$_env_server"
+[ -n "$_env_model" ]  && LISTEN_MODEL="$_env_model"
+[ -n "$_env_dev" ]    && LISTEN_AUDIODEV="$_env_dev"
+LISTEN_SERVER="${LISTEN_SERVER:-}"
+LISTEN_SERVER_TIMEOUT="${LISTEN_SERVER_TIMEOUT:-10}"
+
 # NOT fatal if absent. The local model is the FALLBACK, and on a machine that
 # only ever talks to the server — the Mac beside it, say — there is no reason to
 # require a hand-built whisper before recording a single sample. Failing here
@@ -292,12 +314,7 @@ fi
 # immediately instead of at next login.
 #
 # An explicit environment variable still wins, so one-off overrides work.
-_env_server="${LISTEN_SERVER:-}"
-VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
-[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
-[ -n "$_env_server" ] && LISTEN_SERVER="$_env_server"
-LISTEN_SERVER="${LISTEN_SERVER:-}"
-LISTEN_SERVER_TIMEOUT="${LISTEN_SERVER_TIMEOUT:-10}"
+# Loaded at the top of the script — see "Machine-local config" there.
 
 transcribe_remote() {   # wav -> text on stdout; non-zero if unusable
     [ -n "$LISTEN_SERVER" ] || return 1
