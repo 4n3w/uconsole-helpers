@@ -10,8 +10,9 @@ startups per utterance, which is real load on this CPU.
 
 READS RAW BYTES, NOT THE `wave` MODULE. arecord only finalises the header's
 frame count when the file is closed, so `wave` cannot read a recording that is
-still being written. Samples start at a fixed 44-byte offset for the S16_LE mono
-format bin/ptt records in.
+still being written. The samples' start offset is found by locating the `data`
+chunk, not assumed — arecord and sox both write 44 bytes of header, but that is
+a fact about those writers rather than about WAV.
 
 WILL NOT FIRE UNTIL IT HAS HEARD SOMETHING. Otherwise toggling on and saying
 nothing would stop instantly on the silence that was there from the start.
@@ -37,6 +38,28 @@ import time
 
 RATE, WIDTH, HDR = 16000, 2, 44
 POLL_S = 0.4
+
+
+def data_offset(path, _cache={}):
+    """Where the samples start in a wav still being written.
+
+    arecord and sox both happen to write a plain 44-byte header, but that is a
+    property of those two writers rather than of the format, so find the `data`
+    chunk rather than trusting it. Cached, because this is polled several times a
+    second and the answer cannot change once the header is on disk.
+    """
+    if path in _cache:
+        return _cache[path]
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return HDR
+    i = head.find(b"data", 12)
+    if i == -1:
+        return HDR                      # header not written yet — do not cache
+    _cache[path] = i + 8
+    return i + 8
 
 
 def main():
@@ -97,7 +120,7 @@ def main():
         except OSError:
             return None
         want = int(RATE * secs) * WIDTH
-        if size - HDR < want:
+        if size - data_offset(wav) < want:
             return None
         try:
             with open(wav, "rb") as fh:
@@ -226,13 +249,13 @@ def trace(wav, window, thresh):
 
 
 def _peak(wav, secs):
-    RATE, WIDTH, HDR = 16000, 2, 44
+    RATE, WIDTH = 16000, 2
     try:
         size = os.path.getsize(wav)
     except OSError:
         return None
     want = int(RATE * secs) * WIDTH
-    if size - HDR < want:
+    if size - data_offset(wav) < want:
         return None
     try:
         with open(wav, "rb") as fh:

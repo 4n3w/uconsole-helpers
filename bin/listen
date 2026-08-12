@@ -164,15 +164,51 @@ print(max(256, ctx))
 PY
 }
 
+### Recording backend.
+#
+# arecord on this board; sox's `rec` anywhere else, which is what lets converse
+# run on the Mac beside the model. Both are asked for exactly what whisper wants
+# — 16 kHz mono signed 16-bit — so nothing downstream has to know which ran.
+#
+# sox is NOT a drop-in: duration is a `trim 0 N` effect appended after the file
+# rather than a -d flag, and the sample format is three separate options. It does
+# write a plain 44-byte WAV header, which matters because ptt-silence-watch.py
+# reads a growing file and has to find where the samples start.
+RECORDER=""
+if command -v arecord >/dev/null 2>&1; then
+    RECORDER=arecord
+elif command -v rec >/dev/null 2>&1; then
+    RECORDER=rec
+fi
+
+record_wav() {   # $1 wav, $2 max seconds ("" = until killed)
+    case "$RECORDER" in
+        arecord)
+            if [ -n "$2" ]; then
+                arecord -q -f S16_LE -r 16000 -c 1 -d "$2" "$1" 2>/dev/null
+            else
+                arecord -q -f S16_LE -r 16000 -c 1 "$1" 2>/dev/null
+            fi ;;
+        rec)
+            if [ -n "$2" ]; then
+                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" trim 0 "$2" 2>/dev/null
+            else
+                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" 2>/dev/null
+            fi ;;
+    esac
+}
+
 if [ -n "$infile" ]; then
     # Someone else's file. Never delete it, whatever -k says.
     [ -f "$infile" ] || die "listen: no such file: $infile"
     [ -s "$infile" ] || die "listen: empty recording: $infile"
     wav="$infile"
 else
-    command -v arecord >/dev/null || die "listen: arecord not found (install alsa-utils)"
-    arecord -l 2>/dev/null | grep -q '^card' \
-        || die "listen: no capture device. This board has no built-in mic — plug in a USB one."
+    [ -n "$RECORDER" ] || die "listen: no recorder found (install alsa-utils, or sox for rec)"
+    if [ "$RECORDER" = arecord ]; then
+        arecord -l 2>/dev/null | grep -q '^card' \
+            || die "listen: no capture device. This board has no built-in mic — plug in a USB one."
+    fi
 
     wav=$(mktemp /tmp/listen-XXXXXX.wav)
     cleanup() { [ "$keep" = 1 ] || rm -f "$wav"; }
@@ -183,7 +219,7 @@ else
         # Same detection bin/ptt uses, via the same helper — a second
         # implementation of "have they stopped talking" would drift from it.
         printf '  listening — speak, then stop\n' >&2
-        arecord -q -f S16_LE -r 16000 -c 1 -d 120 "$wav" 2>/dev/null &
+        record_wav "$wav" 120 &
         rec_pid=$!
         python3 "$(dirname "$(readlink -f "$0")")/ptt-silence-watch.py" --wait "$wav" \
             "${LISTEN_SILENCE_SECS:-2}" "${PTT_SILENCE_END_DBFS:-auto}" \
@@ -191,10 +227,10 @@ else
         kill "$rec_pid" 2>/dev/null; wait "$rec_pid" 2>/dev/null
     elif [ -n "$duration" ]; then
         printf '  recording %ss — speak now\n' "$duration" >&2
-        arecord -q -f S16_LE -r 16000 -c 1 -d "$duration" "$wav" 2>/dev/null
+        record_wav "$wav" "$duration"
     else
         printf '  recording — press Enter to stop\n' >&2
-        arecord -q -f S16_LE -r 16000 -c 1 "$wav" 2>/dev/null &
+        record_wav "$wav" "" &
         rec_pid=$!
         read -r _ </dev/tty 2>/dev/null || true
         kill "$rec_pid" 2>/dev/null
