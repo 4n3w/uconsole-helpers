@@ -817,6 +817,13 @@ Every device returns a convincing-looking recording of nothing:
 | A15P Microphone | −96.2 dBFS | −90.3 dBFS | **1** |
 | Fireface UCX II | −96.3 dBFS | −90.3 dBFS | **1** |
 
+**Every audio measurement taken over ssh on a Mac is worthless**, and that is the real
+lesson from the hours this cost. Readings from an ssh session said the Fireface was dead
+on every channel, which led to blaming a webcam and then to blaming the mic. All of it was
+measuring TCC, not audio. **The only valid capture measurements come from a terminal at
+the machine** — that is what `bin/mic-probe` is for, and one four-second run of it settled
+what a dozen remote experiments could not.
+
 **±1 LSB is the tell, and "is the peak zero" is not enough to catch it** — the files
 differ from each other, because the dither is random, so a checksum comparison says
 "three different recordings" and a peak test says "signal present". Both are wrong. The
@@ -824,10 +831,30 @@ level, and the fact that three unrelated microphones agree to a tenth of a dB, a
 give it away. Run it from a terminal *at* the Mac, which will prompt for Microphone
 permission on first use; there is no way to grant it to sshd from the far end.
 
-**`$LISTEN_AUDIODEV` picks the input**, and on a Mac it usually needs setting: the
-default input here is a 20-channel Fireface with nothing plugged into channel 1, which
-records that same −96 dBFS of nothing even with permission granted. List the names with
-`sox -V6 -t coreaudio "" -n trim 0 0.1`.
+**`$LISTEN_AUDIOCHAN` picks a channel, and on an interface it is mandatory.** The mic
+here is on **channel 8 of 20** on a Fireface UCX II, at −14.4 dBFS; every other channel
+reads −96. Without a channel selection sox mixes all twenty to mono and the voice arrives
+13 dB down, buried in nineteen channels of dither — neither silent nor usable, which is
+the most confusing outcome available. `bin/mic-probe` reports every channel separately and
+names the one to use. `$LISTEN_AUDIODEV` selects the *device* and is usually unnecessary,
+since sox follows whatever macOS has set as the input.
+
+**Do not pass `-c`/`-r` to sox when using `remix`.** They are applied to the **input**,
+before the effects chain runs, so sox collapses 20 channels to mono first and `remix 8`
+then dies with *"too few input channels"* — producing **no file at all** rather than a bad
+one. That is why recording appeared to do nothing at all rather than to do it badly.
+Measured against a synthetic 20-channel wav carrying a tone only on channel 8:
+
+| chain | result |
+|---|---|
+| `-c 1 -r 16000 … remix 8` | **FAIL, no output** |
+| `trim … remix 8 … rate 16000` | 1ch 16000 Hz, **−17.8 dBFS** |
+| `trim` only, plain downmix | 1ch 16000 Hz, −30.8 dBFS |
+
+So `record_wav()` passes no format options and lets the effects convert: `trim` first so
+recording stops on time, then the channel, then the rate. Verified that the file still
+grows steadily under this chain (~32 KB/s) and stays readable when killed, which
+`listen -s` and `bin/ptt` depend on.
 
 sox also warns `can't set sample rate 16000; using 44100` and `can't set 1 channels;
 using 20`. That is the *device* negotiation, not the output — sox resamples and downmixes
