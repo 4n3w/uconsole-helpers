@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+#
+# mic-probe — is the capture device actually producing audio, and on which channel?
+#
+#   mic-probe          record 4 seconds from the default input and report
+#   mic-probe 8        record 8 seconds instead
+#
+# WHY THIS EXISTS. A dead or misrouted input does not announce itself. It yields
+# a file of exactly the right size at exactly the right rate, whisper answers it
+# with "." or a confident hallucination, and every mixer reading looks healthy.
+# The failure therefore presents as "transcription is bad" rather than as "the
+# microphone is not connected to anything", which is why it costs hours.
+#
+# It reports EVERY CHANNEL SEPARATELY, which is the part that matters on an audio
+# interface. A mic on 1 of 20 inputs is perfectly audible on its own channel and
+# ~26 dB down once sox mixes all twenty to mono — neither silent nor usable, the
+# most confusing outcome available. Found exactly that on a Fireface UCX II: ch8
+# at -14.4 dBFS, the other nineteen at -96.
+#
+# Set $LISTEN_AUDIOCHAN to the channel this names, in voice.conf.
+
+set -uo pipefail
+secs="${1:-4}"
+
+VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
+[ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
+
+tmpd=$(mktemp -d "${TMPDIR:-/tmp}/micprobe.XXXXXX") || exit 1
+trap 'rm -rf "$tmpd"' EXIT INT TERM
+wav="$tmpd/probe.wav"
+
+case "$(uname -s)" in Darwin) drv=coreaudio ;; *) drv=alsa ;; esac
+
+printf 'recording %ss at native rate and channel count — TALK NOW\n' "$secs" >&2
+if command -v sox >/dev/null 2>&1; then
+    # No -c/-r: take the device exactly as it is, so nothing is mixed away
+    # before it can be measured. That downmix is the very thing being diagnosed.
+    if [ -n "${LISTEN_AUDIODEV:-}" ]; then
+        sox -q -t "$drv" "$LISTEN_AUDIODEV" -b 16 -e signed-integer "$wav" trim 0 "$secs"
+    else
+        rec -q -b 16 -e signed-integer "$wav" trim 0 "$secs"
+    fi
+elif command -v arecord >/dev/null 2>&1; then
+    arecord -q -f S16_LE -r 16000 -c 1 -d "$secs" "$wav"
+else
+    echo "mic-probe: need sox or arecord" >&2; exit 1
+fi
+
+[ -s "$wav" ] || { echo "mic-probe: nothing was recorded — the input could not be opened" >&2; exit 1; }
+
+python3 - "$wav" <<'PY'
+import array, math, struct, sys
+
+d = open(sys.argv[1], "rb").read()
+i = d.find(b"fmt ")
+ch, = struct.unpack("<H", d[i + 10:i + 12])
+rate, = struct.unpack("<I", d[i + 12:i + 16])
+j = d.find(b"data", 12)
+off = j + 8 if j != -1 else 44
+a = array.array("h")
+a.frombytes(d[off:off + (len(d) - off) // 2 * 2])
+if not ch or not len(a):
+    raise SystemExit("mic-probe: unreadable recording")
+
+print("\n%d channel(s) @ %d Hz, %.1f s\n" % (ch, rate, len(a) / ch / rate))
+db = lambda x: -99.0 if x <= 0 else 20 * math.log10(x / 32768.0)
+best = (0, -999.0)
+clipping = False
+for c in range(ch):
+    s = a[c::ch]
+    rms = db(math.sqrt(sum(v * v for v in s) / len(s)))
+    pk = db(max(abs(v) for v in s))
+    if pk >= -0.1:
+        clipping = True
+    if rms > best[1]:
+        best = (c + 1, rms)
+    print("  ch%-3d rms %6.1f  peak %6.1f  %s" % (c + 1, rms, pk, "#" * max(0, int((rms + 90) / 2))))
+
+chan, lvl = best
+print()
+# -70 dBFS is the same dead-mic threshold bin/ptt and bin/listen use: a quiet
+# room with a working mic reads about -43, a dead input -87 to -96.
+if lvl < -70:
+    print("No audio on any channel. The input is not passing signal — check that")
+    print("it is unmuted, selected, and that this terminal has mic permission.")
+else:
+    print("Signal on ch%d at %.1f dBFS." % (chan, lvl))
+    if ch > 1:
+        print("Put this in %s/uconsole/voice.conf:" %
+              __import__("os").environ.get("XDG_CONFIG_HOME", "~/.config"))
+        print("    LISTEN_AUDIOCHAN=%d" % chan)
+    if clipping:
+        print("\nWARNING: peaks are hitting 0 dBFS — the input is clipping. Back the")
+        print("gain off until peaks sit near -6, or accuracy will suffer.")
+PY
