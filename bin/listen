@@ -87,11 +87,13 @@ done
 _env_server="${LISTEN_SERVER:-}"
 _env_model="${LISTEN_MODEL:-}"
 _env_dev="${LISTEN_AUDIODEV:-}"
+_env_chan="${LISTEN_AUDIOCHAN:-}"
 VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
 [ -r "$VOICE_CONF" ] && . "$VOICE_CONF"
 [ -n "$_env_server" ] && LISTEN_SERVER="$_env_server"
 [ -n "$_env_model" ]  && LISTEN_MODEL="$_env_model"
 [ -n "$_env_dev" ]    && LISTEN_AUDIODEV="$_env_dev"
+[ -n "$_env_chan" ]   && LISTEN_AUDIOCHAN="$_env_chan"
 LISTEN_SERVER="${LISTEN_SERVER:-}"
 LISTEN_SERVER_TIMEOUT="${LISTEN_SERVER_TIMEOUT:-10}"
 
@@ -265,17 +267,23 @@ record_wav() {   # $1 wav, $2 max seconds ("" = until killed)
             # input is often an audio interface with nothing plugged into
             # channel 1, which records a convincing -96 dBFS of nothing. List
             # the names with:  sox -V6 -t coreaudio "" -n trim 0 0.1
-            _src=""
+            # $LISTEN_AUDIOCHAN picks ONE channel off a multichannel input.
+            # Without it sox downmixes every channel to mono, so a mic on 1 of
+            # 20 inputs is buried ~26 dB under nineteen channels of nothing —
+            # which reads as "the mic does not work" rather than as a routing
+            # problem, because the recording is neither silent nor usable.
+            _remix=""
+            [ -n "${LISTEN_AUDIOCHAN:-}" ] && _remix="remix $LISTEN_AUDIOCHAN"
             if [ -n "${LISTEN_AUDIODEV:-}" ]; then
                 case "$(uname -s)" in
                     Darwin) _drv=coreaudio ;;
                     *)      _drv=alsa ;;
                 esac
                 sox -q -t "$_drv" "$LISTEN_AUDIODEV" -c 1 -r 16000 -b 16 \
-                    -e signed-integer "$1" ${2:+trim 0 "$2"} 2>/dev/null
+                    -e signed-integer "$1" $_remix ${2:+trim 0 "$2"} 2>/dev/null
             else
                 rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" \
-                    ${2:+trim 0 "$2"} 2>/dev/null
+                    $_remix ${2:+trim 0 "$2"} 2>/dev/null
             fi ;;
     esac
 }
