@@ -170,7 +170,11 @@ capture() {
         IFS= read -r -e -p '  you> ' line || return 1
         printf '%s' "$line"
     else
-        "$LISTEN" -s 2>/dev/null
+        # stderr is NOT discarded. It used to be, which meant listen's dead-mic
+        # warning and every other diagnostic vanished — so a broken capture
+        # presented as converse simply doing nothing, with no way to tell a
+        # silent mic from a hung server from a failed transcription.
+        "$LISTEN" -s
     fi
 }
 
