@@ -1409,6 +1409,20 @@ sudo systemctl reload NetworkManager
 
 ## Gotchas
 
+- **`voice.conf` is *sourced*, so a value containing a space needs quotes.**
+  `LISTEN_AUDIODEV=Insta360 Link 2` is not a broken assignment, it is a valid one —
+  bash reads it as `VAR=value command args`, running `Link` with argument `2`. So it
+  reports `Link: 2: No such file or directory`, and worse, the variable is set **only for
+  that command**, meaning it is unset afterwards with no further complaint. The visible
+  symptom was one confusing error and a microphone that silently was not the one asked
+  for. Quote anything with a space.
+- **A dead capture device does not announce itself**, so `bin/listen` now warns when a
+  recording comes back below −70 dBFS. Nothing else in the chain can tell you: the file
+  is the right size at the right rate, and whisper answers a silent file with `.` or a
+  confident hallucination — a 2 s recording of nothing came back as *"Thank you."* here
+  while testing this. The failure therefore presents as "transcription is bad" rather
+  than as "the microphone is off", which is why it wastes so much time. Same threshold
+  and the same fail-open rule as `bin/ptt`, which has gated on this for longer.
 - **`mktemp` templates: GNU takes the `XXXXXX` anywhere, BSD demands it last.**
   `mktemp /tmp/listen-XXXXXX.wav` worked here for months and on a Mac produces a file
   called *literally* `listen-XXXXXX.wav` — no error, no randomness, and every concurrent

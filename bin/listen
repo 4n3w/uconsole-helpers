@@ -191,6 +191,50 @@ print(max(256, ctx))
 PY
 }
 
+### Is the capture device actually producing anything?
+#
+# A dead input does not announce itself: it records a file of exactly the right
+# size at exactly the right rate, whisper returns "." or a hallucinated fragment,
+# and nothing anywhere says "your microphone is off". That is a genuinely
+# confusing failure — it presents as "the transcription is bad" rather than as a
+# hardware fault. bin/ptt has gated on this for a while; listen did not, so
+# running it on a new machine with the wrong input selected just looked broken.
+#
+# -70 dBFS is the same threshold ptt uses, and it sits in a ~40 dB gulf: a quiet
+# room with a working mic reads about -43, a dead one about -87 to -96. It is a
+# DEAD-MIC ALARM, not a speech detector — separating "quiet room" from "someone
+# talking" is a far narrower margin and a threshold slightly wrong there would
+# eat real dictation.
+#
+# Warns rather than dies, and stays silent if python3 is missing or the file is
+# not what it expects. A diagnostic that can block transcription is a bad trade.
+warn_if_silent() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    verdict=$(python3 - "$1" <<'RMS' 2>/dev/null
+import array, math, sys
+try:
+    d = open(sys.argv[1], "rb").read()
+    i = d.find(b"data", 12)
+    off = i + 8 if i != -1 else 44
+    a = array.array("h")
+    a.frombytes(d[off:off + (len(d) - off) // 2 * 2])
+    a = a[::16] or a                       # flat cost regardless of length
+    if len(a):
+        acc = sum(v * v for v in a)
+        db = -99.0 if acc == 0 else 20 * math.log10(math.sqrt(acc / len(a)) / 32768.0)
+        print("%s %.1f" % ("SILENT" if db < -70 else "OK", db))
+except Exception:
+    pass
+RMS
+)
+    case "$verdict" in
+        SILENT*)
+            printf '  WARNING: capture was %s dBFS — the mic is producing nothing.\n' \
+                   "${verdict#SILENT }" >&2
+            printf '           Check it is unmuted and selected ($LISTEN_AUDIODEV).\n' >&2 ;;
+    esac
+}
+
 ### Recording backend.
 #
 # arecord on this board; sox's `rec` anywhere else, which is what lets converse
@@ -282,6 +326,7 @@ else
     fi
 
     [ -s "$wav" ] || die "listen: nothing was recorded"
+    warn_if_silent "$wav"
 fi
 
 ### Remote transcription, with the local model as fallback.
