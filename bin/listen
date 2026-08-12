@@ -73,7 +73,12 @@ done
 
 [ -n "$infile" ] && [ -n "$duration" ] && die "listen: -f and -d are mutually exclusive"
 
-BIN=$(find_bin) || die "listen: whisper.cpp binary not found under $WHISPER_DIR"
+# NOT fatal if absent. The local model is the FALLBACK, and on a machine that
+# only ever talks to the server — the Mac beside it, say — there is no reason to
+# require a hand-built whisper before recording a single sample. Failing here
+# also fails too early to know whether $LISTEN_SERVER is set, since voice.conf is
+# read further down. So resolve what exists and complain at the point of use.
+BIN=$(find_bin) || BIN=""
 
 # Resolve the model: explicit -m, else $LISTEN_MODEL, else the default below,
 # else whatever is actually installed.
@@ -123,7 +128,7 @@ else
         MODEL=$(ls -S "$MODEL_DIR"/ggml-*.bin 2>/dev/null | tail -1)
     fi
 fi
-[ -n "${MODEL:-}" ] && [ -f "$MODEL" ] || die "listen: no model found in $MODEL_DIR"
+[ -n "${MODEL:-}" ] && [ -f "$MODEL" ] || MODEL=""   # see the BIN note above
 
 ### Encoder audio context — the single biggest speed lever on this board.
 #
@@ -298,6 +303,12 @@ if [ -n "$LISTEN_SERVER" ]; then
 fi
 
 if [ -z "$text" ]; then
+if [ -z "$BIN" ] || [ -z "$MODEL" ]; then
+    if [ -n "$LISTEN_SERVER" ]; then
+        die "listen: $LISTEN_SERVER did not answer, and there is no local model to fall back to"
+    fi
+    die "listen: no whisper.cpp under $WHISPER_DIR, and no LISTEN_SERVER set"
+fi
 AC=$(audio_ctx_for "$wav")
 AC_ARGS=""
 [ -n "${AC:-}" ] && AC_ARGS="-ac $AC"
