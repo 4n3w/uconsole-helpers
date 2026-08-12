@@ -263,27 +263,39 @@ record_wav() {   # $1 wav, $2 max seconds ("" = until killed)
                 arecord -q -f S16_LE -r 16000 -c 1 "$1" 2>/dev/null
             fi ;;
         rec)
-            # $LISTEN_AUDIODEV picks the input. Worth setting: a Mac's default
-            # input is often an audio interface with nothing plugged into
-            # channel 1, which records a convincing -96 dBFS of nothing. List
-            # the names with:  sox -V6 -t coreaudio "" -n trim 0 0.1
-            # $LISTEN_AUDIOCHAN picks ONE channel off a multichannel input.
-            # Without it sox downmixes every channel to mono, so a mic on 1 of
-            # 20 inputs is buried ~26 dB under nineteen channels of nothing —
-            # which reads as "the mic does not work" rather than as a routing
-            # problem, because the recording is neither silent nor usable.
-            _remix=""
-            [ -n "${LISTEN_AUDIOCHAN:-}" ] && _remix="remix $LISTEN_AUDIOCHAN"
+            # $LISTEN_AUDIODEV picks the input device; $LISTEN_AUDIOCHAN picks
+            # one channel off it, which an audio interface needs — a mic on 1 of
+            # 20 inputs is fine on its own channel and ~13 dB down once sox mixes
+            # all twenty together, which is neither silent nor usable.
+            #
+            # NO -c OR -r HERE, AND THAT IS THE WHOLE POINT. Those are applied to
+            # the INPUT before the effects chain runs, so sox collapses 20
+            # channels to mono first and `remix 8` then dies with "too few input
+            # channels" — producing NO FILE AT ALL rather than a bad one. Proved
+            # against a synthetic 20-channel wav with a tone only on channel 8:
+            #
+            #   -c 1 -r 16000 ... remix 8   FAIL, no output
+            #   trim / remix / rate         1ch 16000 Hz, -17.8 dBFS  <- correct
+            #   trim only (downmix)         1ch 16000 Hz, -30.8 dBFS
+            #
+            # So the effects do every conversion: trim first, so recording stops
+            # on time; then pick the channel; then resample to what whisper wants.
+            _fx="${2:+trim 0 $2}"
+            if [ -n "${LISTEN_AUDIOCHAN:-}" ]; then
+                _fx="$_fx remix $LISTEN_AUDIOCHAN"
+            else
+                _fx="$_fx channels 1"
+            fi
+            _fx="$_fx rate 16000"
             if [ -n "${LISTEN_AUDIODEV:-}" ]; then
                 case "$(uname -s)" in
                     Darwin) _drv=coreaudio ;;
                     *)      _drv=alsa ;;
                 esac
-                sox -q -t "$_drv" "$LISTEN_AUDIODEV" -c 1 -r 16000 -b 16 \
-                    -e signed-integer "$1" $_remix ${2:+trim 0 "$2"} 2>/dev/null
+                sox -q -t "$_drv" "$LISTEN_AUDIODEV" -b 16 -e signed-integer \
+                    "$1" $_fx 2>/dev/null
             else
-                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" \
-                    $_remix ${2:+trim 0 "$2"} 2>/dev/null
+                rec -q -b 16 -e signed-integer "$1" $_fx 2>/dev/null
             fi ;;
     esac
 }
