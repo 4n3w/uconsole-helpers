@@ -6,6 +6,8 @@
 #   converse "opening line"  start with something already said
 #   converse -1 "question"   one exchange, then exit
 #   converse -t              text in, speech out (type instead of talking)
+#   converse -q              speech in, text out (nothing comes out the speaker)
+#   converse -qt             text in, text out — a plain chat, silent both ways
 #
 # Speak, stop speaking, hear the answer. Ctrl-C ends it.
 #
@@ -34,7 +36,7 @@ set -uo pipefail
 
 HERE="$(dirname "$(readlink -f "$0")")"
 LISTEN="$HERE/listen"
-SAY="$HERE/say"
+SAY="${CONVERSE_SAY:-$HERE/say}"   # /usr/bin/say on a Mac
 
 # Shared machine-local config: the whisper server lives here too.
 VOICE_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/uconsole/voice.conf"
@@ -45,18 +47,20 @@ CHAT_MODEL="${CHAT_MODEL:-local}"
 # Kept short deliberately. A model that answers in three sentences feels like a
 # conversation; one that answers in three paragraphs is a lecture you cannot
 # skim, because speech has no skimming.
-CHAT_SYSTEM="${CHAT_SYSTEM:-You are a concise spoken assistant. Reply in at most three short sentences. Never use markdown, lists, code blocks or emoji — everything you say is read aloud.}"
+CHAT_SYSTEM="${CHAT_SYSTEM:-You are a concise spoken assistant. Reply in at most three short sentences. Never use markdown, lists, code blocks or emoji — everything you say is read aloud. You are running locally on a small computer on a private home network. You are not a cloud service and have no internet access.}"
 CHAT_MAX_TOKENS="${CHAT_MAX_TOKENS:-300}"
 CHAT_TURNS="${CHAT_TURNS:-12}"      # exchanges of history kept
 
 die() { printf 'converse: %s\n' "$*" >&2; exit 1; }
 
-one_shot=0; text_mode=0; opening=""
+one_shot=0; text_mode=0; quiet=0; opening=""
 while [ $# -gt 0 ]; do
     case "$1" in
         -1|--once)  one_shot=1; shift ;;
         -t|--text)  text_mode=1; shift ;;
-        -h|--help)  sed -n '3,11p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -q|--quiet) quiet=1; shift ;;
+        -qt|-tq)    text_mode=1; quiet=1; shift ;;
+        -h|--help)  sed -n '3,13p' "$0" | sed 's/^# \?//'; exit 0 ;;
         -*)         die "unknown option $1" ;;
         *)          opening="$*"; break ;;
     esac
@@ -64,21 +68,22 @@ done
 
 [ -n "$CHAT_SERVER" ] || die "set CHAT_SERVER in $VOICE_CONF (e.g. http://host:8080)"
 command -v curl >/dev/null || die "curl not found"
-[ -x "$LISTEN" ] || die "bin/listen not found"
+[ "$text_mode" = 1 ] || [ -x "$LISTEN" ] || die "bin/listen not found (or use -t to type)"
+[ "$quiet" = 1 ] || command -v "$SAY" >/dev/null || [ -x "$SAY" ] || die "no speech synthesiser at $SAY (or use -q to stay silent)"
 
-HIST="$(mktemp)"; : >"$HIST"
-trap 'rm -f "$HIST"; "$SAY" --stop 2>/dev/null; exit 0' EXIT INT TERM
+HIST="$(mktemp "${TMPDIR:-/tmp}/converse.XXXXXX")"; : >"$HIST"   # BSD mktemp needs the template
+trap 'rm -f "$HIST"; [ "$quiet" = 1 ] || "$SAY" --stop 2>/dev/null; exit 0' EXIT INT TERM
 
 # One exchange. Reads the reply as a token stream and hands piper each sentence
 # as it completes, rather than waiting for the whole thing.
 exchange() {
     local user="$1"
     python3 - "$CHAT_SERVER" "$CHAT_MODEL" "$CHAT_SYSTEM" "$HIST" "$user" \
-             "$SAY" "$CHAT_MAX_TOKENS" "$CHAT_TURNS" <<'PY'
+             "$SAY" "$CHAT_MAX_TOKENS" "$CHAT_TURNS" "$quiet" <<'PY'
 import json, os, re, subprocess, sys, urllib.request
 
-server, model, system, hist_path, user, say, maxtok, turns = sys.argv[1:9]
-maxtok, turns = int(maxtok), int(turns)
+server, model, system, hist_path, user, say, maxtok, turns, quiet = sys.argv[1:10]
+maxtok, turns, quiet = int(maxtok), int(turns), quiet == "1"
 
 history = []
 if os.path.exists(hist_path):
@@ -105,6 +110,8 @@ BAD = re.compile(r"[*_`#]+")          # markdown that piper would read aloud
 proc = None
 def speak(text):
     global proc
+    if quiet:
+        return
     text = BAD.sub("", text).strip()
     if not text:
         return

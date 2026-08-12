@@ -794,6 +794,39 @@ while the second is still generating. Perceived latency becomes time-to-first-*s
 The boundary is punctuation followed by whitespace, not punctuation alone — otherwise
 "3.5" and "Dr." split mid-number and mid-title.
 
+**Three modes, and the speaker is optional.** `-q` suppresses piper entirely — you
+speak, the reply streams to the terminal and nothing comes out the speaker. `-qt` is
+silent in both directions, i.e. a plain typed chat against the local model. `-t` alone is
+the original: type, hear the answer.
+
+| | in | out |
+|---|---|---|
+| `converse` | voice | speech |
+| `converse -q` | voice | text |
+| `converse -t` | typed | speech |
+| `converse -qt` | typed | text |
+
+**It runs on the Mac as well, and needed three fixes to get there** — verified against
+`/bin/bash` 3.2 on darwin25. `$CONVERSE_SAY` overrides the synthesiser, so
+`/usr/bin/say` substitutes for piper; the `bin/listen` and `bin/say` checks now only fire
+in the modes that actually use them; and `mktemp` is given an explicit template, because
+BSD `mktemp` requires one where GNU does not. What does **not** work there yet is voice
+*input*: the Mac has no `arecord`, `sox` or `ffmpeg`, and `bin/listen` is written against
+`arecord`. `brew install sox` plus a recorder branch in `listen` would close it.
+
+```bash
+CHAT_SERVER=http://127.0.0.1:8179 CONVERSE_SAY=/usr/bin/say ./converse -t
+```
+
+**The system prompt has to state where the model is running, or it invents an answer.**
+Qwen asked what machine it is on will cheerfully claim to be on Alibaba Cloud — it is an
+Alibaba model, so that is what its training data says, and nothing in a bare
+`/v1/chat/completions` call tells it otherwise. One clause fixes it: *"You are running
+locally on a small computer on a private home network. You are not a cloud service and
+have no internet access."* Worth remembering as a general property rather than a Qwen
+quirk — **a local model knows nothing about its own deployment**, so anything it says
+about its hardware, network or provenance is a guess unless the prompt tells it.
+
 **A small model was the right first choice.** For conversation, *time to first token*
 dominates perceived quality: something that starts talking in 0.34 s feels far better
 than a cleverer model that pauses two seconds. Swapping models later changes nothing but
@@ -1334,6 +1367,13 @@ sudo systemctl reload NetworkManager
 
 ## Gotchas
 
+- **An apostrophe inside `"${VAR:-default}"` opens a quote and breaks the whole file.**
+  Bash does not treat the default-value word as quoted just because the expansion is —
+  so `X="${X:-the user's box}"` is a syntax error, and the error is reported at **end of
+  file** rather than at the line responsible. This cost a confusing minute when a
+  one-clause addition to `converse`'s system prompt made `bash -n` complain about line
+  184 of a 188-line script. Reword to avoid the apostrophe, or escape it. Prose that
+  lands in a shell default value is worth a `bash -n` every time.
 - **`class` vs `app_id`.** Under sway, `for_window [class=...]` matches only XWayland
   clients. Native Wayland windows need `app_id`. The base config carries both rules;
   anything new needs the same treatment.
