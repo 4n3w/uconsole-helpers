@@ -195,10 +195,21 @@ record_wav() {   # $1 wav, $2 max seconds ("" = until killed)
                 arecord -q -f S16_LE -r 16000 -c 1 "$1" 2>/dev/null
             fi ;;
         rec)
-            if [ -n "$2" ]; then
-                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" trim 0 "$2" 2>/dev/null
+            # $LISTEN_AUDIODEV picks the input. Worth setting: a Mac's default
+            # input is often an audio interface with nothing plugged into
+            # channel 1, which records a convincing -96 dBFS of nothing. List
+            # the names with:  sox -V6 -t coreaudio "" -n trim 0 0.1
+            _src=""
+            if [ -n "${LISTEN_AUDIODEV:-}" ]; then
+                case "$(uname -s)" in
+                    Darwin) _drv=coreaudio ;;
+                    *)      _drv=alsa ;;
+                esac
+                sox -q -t "$_drv" "$LISTEN_AUDIODEV" -c 1 -r 16000 -b 16 \
+                    -e signed-integer "$1" ${2:+trim 0 "$2"} 2>/dev/null
             else
-                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" 2>/dev/null
+                rec -q -c 1 -r 16000 -b 16 -e signed-integer "$1" \
+                    ${2:+trim 0 "$2"} 2>/dev/null
             fi ;;
     esac
 }
@@ -215,8 +226,14 @@ else
             || die "listen: no capture device. This board has no built-in mic — plug in a USB one."
     fi
 
-    wav=$(mktemp /tmp/listen-XXXXXX.wav)
-    cleanup() { [ "$keep" = 1 ] || rm -f "$wav"; }
+    # A directory, not a file, because the name has to end in .wav for sox to
+    # infer the format AND the XXXXXX has to be last for BSD mktemp. Those two
+    # cannot both hold in one template. GNU mktemp accepts XXXXXX anywhere,
+    # which is why `listen-XXXXXX.wav` worked here for months while producing a
+    # file literally called that on a Mac — so every concurrent run collided.
+    tmpd=$(mktemp -d "${TMPDIR:-/tmp}/listen.XXXXXX") || die "listen: mktemp failed"
+    wav="$tmpd/rec.wav"
+    cleanup() { [ "$keep" = 1 ] || rm -rf "$tmpd"; }
     trap cleanup EXIT INT TERM
 
     # 16 kHz mono, signed 16-bit — exactly what whisper.cpp wants.

@@ -806,17 +806,59 @@ the original: type, hear the answer.
 | `converse -t` | typed | speech |
 | `converse -qt` | typed | text |
 
-**It runs on the Mac as well, and needed three fixes to get there** — verified against
-`/bin/bash` 3.2 on darwin25. `$CONVERSE_SAY` overrides the synthesiser, so
-`/usr/bin/say` substitutes for piper; the `bin/listen` and `bin/say` checks now only fire
-in the modes that actually use them; and `mktemp` is given an explicit template, because
-BSD `mktemp` requires one where GNU does not. What does **not** work there yet is voice
-*input*: the Mac has no `arecord`, `sox` or `ffmpeg`, and `bin/listen` is written against
-`arecord`. `brew install sox` plus a recorder branch in `listen` would close it.
+**Voice input on the Mac is blocked by macOS, not by anything here.** `sox` is
+installed and `bin/listen` records through it correctly — but **an ssh session has no
+microphone permission, and CoreAudio answers that with silence rather than an error**.
+Every device returns a convincing-looking recording of nothing:
+
+| input | rms | peak | max sample |
+|---|---|---|---|
+| Insta360 Link 2 | −96.3 dBFS | −90.3 dBFS | **1** |
+| A15P Microphone | −96.2 dBFS | −90.3 dBFS | **1** |
+| Fireface UCX II | −96.3 dBFS | −90.3 dBFS | **1** |
+
+**±1 LSB is the tell, and "is the peak zero" is not enough to catch it** — the files
+differ from each other, because the dither is random, so a checksum comparison says
+"three different recordings" and a peak test says "signal present". Both are wrong. The
+level, and the fact that three unrelated microphones agree to a tenth of a dB, are what
+give it away. Run it from a terminal *at* the Mac, which will prompt for Microphone
+permission on first use; there is no way to grant it to sshd from the far end.
+
+**`$LISTEN_AUDIODEV` picks the input**, and on a Mac it usually needs setting: the
+default input here is a 20-channel Fireface with nothing plugged into channel 1, which
+records that same −96 dBFS of nothing even with permission granted. List the names with
+`sox -V6 -t coreaudio "" -n trim 0 0.1`.
+
+sox also warns `can't set sample rate 16000; using 44100` and `can't set 1 channels;
+using 20`. That is the *device* negotiation, not the output — sox resamples and downmixes
+on the way to the file, and the wav is a correct 16 kHz mono s16. The warning is noise.
+
+**It runs on the Mac as well**, from a real checkout of this repo at
+`~/workspace/uconsole-helpers` — not a copied file, which would drift the moment either
+side changed. Verified against `/bin/bash` **3.2**. Four portability fixes were needed,
+and every one of them was a place where GNU is permissive and BSD is not:
+
+| | |
+|---|---|
+| `$CONVERSE_SAY` | selects the synthesiser — `/usr/bin/say` stands in for piper |
+| `mktemp` | BSD needs a template; GNU invents one |
+| `mktemp -d` | BSD needs the `XXXXXX` **last**, so a `.wav` suffix cannot share the template — see below |
+| tool checks | `listen`/`say` are only required in the modes that use them |
 
 ```bash
-CHAT_SERVER=http://127.0.0.1:8179 CONVERSE_SAY=/usr/bin/say ./converse -t
+CHAT_SERVER=http://127.0.0.1:8179 CONVERSE_SAY=/usr/bin/say ./bin/converse -t
 ```
+
+**`bin/listen` picks a recording backend**: `arecord` here, sox's `rec` elsewhere. sox is
+not a drop-in — duration is a `trim 0 N` effect appended *after* the filename rather than
+a `-d` flag, and the sample format is three separate options — so it sits behind
+`record_wav()` and nothing downstream knows which one ran.
+
+**The local model is no longer a prerequisite.** `listen` used to die at startup with no
+hand-built whisper.cpp, *even with a server configured*, and it died before `voice.conf`
+had been read — so it could not have known there was one. That made it unusable on any
+client-only machine, the Mac hosting the server included. It now resolves what exists and
+complains at the point of use.
 
 **The system prompt has to state where the model is running, or it invents an answer.**
 Qwen asked what machine it is on will cheerfully claim to be on Alibaba Cloud — it is an
@@ -1367,6 +1409,18 @@ sudo systemctl reload NetworkManager
 
 ## Gotchas
 
+- **`mktemp` templates: GNU takes the `XXXXXX` anywhere, BSD demands it last.**
+  `mktemp /tmp/listen-XXXXXX.wav` worked here for months and on a Mac produces a file
+  called *literally* `listen-XXXXXX.wav` — no error, no randomness, and every concurrent
+  run writing the same path. The fix is a temp *directory*, because the name must end in
+  `.wav` for sox to infer the format and the `X`s must be last for BSD, and one template
+  cannot do both.
+- **A microphone that returns silence looks like a microphone.** macOS denies mic access
+  to ssh sessions by handing back digital silence rather than an error, and dithered
+  silence is not all zeros — it is ±1 LSB, so a peak-is-zero test passes it and a
+  checksum comparison of two such files says they differ. Judge capture by **level**
+  (−96 dBFS is not a room) and by whether unrelated devices implausibly agree. The same
+  reasoning is why `bin/ptt` gates on rms against a −70 dBFS floor.
 - **An apostrophe inside `"${VAR:-default}"` opens a quote and breaks the whole file.**
   Bash does not treat the default-value word as quoted just because the expansion is —
   so `X="${X:-the user's box}"` is a syntax error, and the error is reported at **end of
