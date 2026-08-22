@@ -262,6 +262,7 @@ Nothing outstanding. `tty/rose-pine-tty.sh` was **confirmed painting on a real V
 | `bin/ptt` | dictation. `toggle [--enter]`/`start`/`stop`/`cancel`/`status`. Bound in `10-uconsole.conf` to `$mod+/` (toggle) and `$mod+\` (toggle, then Return); types the transcript into the focused window |
 | `bin/converse` | spoken conversation with a LAN chat model. `-q` no speaker, `-t` typed input, `-qt` both. Runs on the Mac too |
 | `bin/mic-probe` | per-channel levels off a capture device, and which channel the mic is actually on. The tool to reach for when capture is broken |
+| `bin/power-probe` | median current draw over N seconds. **Refuses to run on AC**, where the number is meaningless. `-q` prints just the mA, for scripting |
 
 **Everything a human types is symlinked into `~/.local/bin` by `install.sh`.** Three files
 are deliberately not: `battery-remaining`, because starship invokes it by absolute path
@@ -741,9 +742,30 @@ reason" rather than as a network fault, and is exactly how it was noticed. It re
 every interface bring-up, so `bin/wifi` sets it each time rather than relying on a
 one-off command. `WIFI_POWER_SAVE=on` restores the default.
 
-The battery cost is **unmeasured** — the device was on AC when this was tested, where
-`current_now` reads ~0 because it reports battery current. Worth measuring unplugged
-before assuming it is free.
+The battery cost is **still unmeasured**, and the reason is worth keeping: the device was
+on AC when this was tested, where `current_now` reports battery current and so reads a few
+mA. Not zero — a small, plausible, completely meaningless number, which is exactly the sort
+that gets written into a table and believed.
+
+`bin/power-probe` exists so this can be finished, and **it refuses to run on mains** rather
+than returning that number. Confirmed on this board: plugged in it reads **5 mA** against
+the ~800 mA the backlight measurements found. Note the PMU contradicts itself here —
+`axp22x-ac/online` says `1` while the battery `status` has been seen reading both
+`Charging` and `Discharging` — so the check tests both tells and refuses if either fires.
+
+To finish it: unplug, fix the backlight, close everything, then **interleave**, because the
+governor and the panel both drift over minutes.
+
+```bash
+for i in 1 2 3; do
+  sudo iw dev wlan0 set power_save on;  power-probe -n 60 ps-on
+  sudo iw dev wlan0 set power_save off; power-probe -n 60 ps-off
+done
+```
+
+Compare medians, and expect a small number against ~800 mA total — that is a real result,
+and it is the one that decides whether `WIFI_POWER_SAVE=on` is worth reaching for on
+battery away from the LAN.
 
 **Historical note.** `ping` showed `min/avg/max/mdev =
 4.4/30.3/182.8/45.3 ms` — `mdev` of 45 ms is the tell, and `iw dev wlan0 get power_save`

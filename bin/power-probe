@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+#
+# power-probe — what is this board actually drawing right now?
+#
+#   power-probe                     30s, print a report
+#   power-probe -n 60 wifi-ps-off   60s, labelled
+#   power-probe -q                  just the median mA, for scripting
+#
+# Answers "does X cost battery?" — the question this device keeps asking. The
+# backlight table in CLAUDE.md came from exactly this measurement, done by hand,
+# with nothing left behind to repeat it. This is that, kept.
+#
+# IT REFUSES TO RUN ON AC, AND THAT IS THE POINT OF IT.
+#
+# current_now reports BATTERY current. On mains it reads a few mA — a small,
+# plausible, entirely meaningless number, the kind that gets written into a table
+# and believed. That is not hypothetical: the wifi power-save measurement was
+# taken on AC and had to be thrown away, and CLAUDE.md still carries "the battery
+# cost is unmeasured" because of it. A tool that returns 6 mA without comment is
+# worse than no tool.
+#
+# MEDIAN, NOT MEAN. CPU load moves this by tens of mA, so one scheduler decision
+# during the run drags a mean somewhere it should not go. The same reasoning as
+# the whisper benchmarks: on this board the noise is additive and one-sided.
+#
+# METHOD, for anything worth comparing:
+#
+#   * unplugged, screen at a FIXED brightness (it is ~46% of total draw at max),
+#     nothing else running
+#   * INTERLEAVE the variants — A B A B, never all of A then all of B. The
+#     governor, the panel and the room all drift over minutes.
+#   * several runs each, and compare medians
+#
+# All arithmetic is integer and the products reach ~3e12: fine in bash's 64-bit
+# math, an overflow anywhere else. Same caveat as bin/battery-remaining.
+
+set -uo pipefail
+
+SECS=30
+INTERVAL=1
+QUIET=0
+FORCE=0
+LABEL=""
+
+die() { printf 'power-probe: %s\n' "$1" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -n) SECS="${2:-}"; shift 2 ;;
+        -i) INTERVAL="${2:-}"; shift 2 ;;
+        -q|--quiet) QUIET=1; shift ;;
+        -f|--force) FORCE=1; shift ;;
+        -h|--help) sed -n '3,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -*) die "unknown option: $1" ;;
+        *)  LABEL="$1"; shift ;;
+    esac
+done
+
+# --- find the battery, the same way bin/battery-remaining does -----------------
+
+BAT=""
+for d in /sys/class/power_supply/*/; do
+    [ "$(cat "$d/type" 2>/dev/null)" = "Battery" ] || continue
+    BAT="${d%/}"; break
+done
+[ -n "$BAT" ] || die "no battery — there is nothing to measure"
+[ -r "$BAT/current_now" ] || die "$BAT exposes no current_now"
+
+# --- refuse on mains ----------------------------------------------------------
+#
+# Two independent tells, because this PMU disagrees with itself: the axp20x
+# reports status=Discharging while the AC supply reports online=1 on a plugged-in
+# board. Trusting either one alone would let a mains reading through.
+
+on_mains=""
+for d in /sys/class/power_supply/*/; do
+    case "$(cat "$d/type" 2>/dev/null)" in
+        Mains|USB|USB_PD|USB_PD_DRP) ;;
+        *) continue ;;
+    esac
+    [ "$(cat "$d/online" 2>/dev/null)" = "1" ] && on_mains="$(basename "${d%/}")"
+done
+status=$(cat "$BAT/status" 2>/dev/null)
+
+if [ -n "$on_mains" ] || { [ -n "$status" ] && [ "$status" != "Discharging" ]; }; then
+    printf 'power-probe: on mains (%s%s) — current_now measures BATTERY current,\n' \
+        "${on_mains:-status=$status}" \
+        "$([ -n "$on_mains" ] && [ -n "$status" ] && printf ', status=%s' "$status")" >&2
+    printf '            so it reads a few mA here and means nothing. Unplug first.\n' >&2
+    [ "$FORCE" = 1 ] || exit 1
+    printf '            --force given; the numbers below are not a measurement.\n' >&2
+fi
+
+# --- sample -------------------------------------------------------------------
+
+samples=""
+n=0
+end=$(( $(date +%s) + SECS ))
+while [ "$(date +%s)" -lt "$end" ]; do
+    i=$(cat "$BAT/current_now" 2>/dev/null)
+    case "$i" in ''|*[!0-9-]*) i="" ;; esac
+    if [ -n "$i" ]; then
+        samples="$samples$(( i < 0 ? -i : i ))
+"
+        n=$(( n + 1 ))
+    fi
+    sleep "$INTERVAL"
+done
+[ "$n" -gt 0 ] || die "no readable samples from $BAT/current_now"
+
+sorted=$(printf '%s' "$samples" | sort -n)
+pick() { printf '%s' "$sorted" | sed -n "$1p"; }
+
+median_ua=$(pick $(( (n + 1) / 2 )))
+q1_ua=$(pick $(( (n + 3) / 4 )))
+q3_ua=$(pick $(( (3 * n + 1) / 4 )))
+min_ua=$(pick 1)
+max_ua=$(pick "$n")
+
+ma() { echo $(( ${1:-0} / 1000 )); }
+median_ma=$(ma "$median_ua")
+
+if [ "$QUIET" = 1 ]; then
+    echo "$median_ma"
+    exit 0
+fi
+
+volt_uv=$(cat "$BAT/voltage_now" 2>/dev/null)
+case "$volt_uv" in ''|*[!0-9]*) volt_uv=0 ;; esac
+
+printf 'power-probe%s\n' "${LABEL:+: $LABEL}"
+printf '  %d samples over %ss, %ss apart\n' "$n" "$SECS" "$INTERVAL"
+if [ "$volt_uv" -gt 0 ]; then
+    # mW = µV * µA / 1e9. Peaks near 3e12 before the divide — 64-bit only.
+    mw=$(( volt_uv * median_ua / 1000000000 ))
+    printf '  median   %d mA   (%d.%02d W at %d.%02d V)\n' \
+        "$median_ma" $(( mw / 1000 )) $(( (mw % 1000) / 10 )) \
+        $(( volt_uv / 1000000 )) $(( (volt_uv % 1000000) / 10000 ))
+else
+    printf '  median   %d mA\n' "$median_ma"
+fi
+printf '  IQR      %d-%d mA\n'   "$(ma "$q1_ua")"  "$(ma "$q3_ua")"
+printf '  range    %d-%d mA\n'   "$(ma "$min_ua")" "$(ma "$max_ua")"
+
+# Load is context, not decoration: a comparison taken while something was
+# compiling is not a comparison, and this is the cheapest way to notice.
+printf '  load     %s\n' "$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null)"
+
+bl=/sys/class/backlight/backlight@0
+if [ -r "$bl/actual_brightness" ]; then
+    printf '  backlight %s\n' "$(cat "$bl/actual_brightness")"
+fi
+
+# No configuration of this board with the panel lit draws this little. If it does,
+# something is still feeding it and the mains check above did not catch it.
+if [ "$median_ma" -lt 100 ]; then
+    printf '\n  WARNING: %d mA is implausible for a running board. Still on power?\n' \
+        "$median_ma" >&2
+fi

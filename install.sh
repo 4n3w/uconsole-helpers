@@ -165,9 +165,11 @@ do_links() {
     link "$HOME/uconsole/bin/listen"            "$HOME/.local/bin/listen"
     link "$HOME/uconsole/bin/audio"             "$HOME/.local/bin/audio"
     link "$HOME/uconsole/bin/backlight"         "$HOME/.local/bin/backlight"
-    # mic-probe is a diagnostic, and the one you reach for when capture is broken —
-    # i.e. the worst possible time to discover it is not on PATH.
+    # The two probes are diagnostics. mic-probe especially: it is what you reach
+    # for when capture is broken, i.e. the worst possible moment to discover it is
+    # not on PATH.
     link "$HOME/uconsole/bin/mic-probe"         "$HOME/.local/bin/mic-probe"
+    link "$HOME/uconsole/bin/power-probe"       "$HOME/.local/bin/power-probe"
 
     # DELIBERATELY NOT LINKED, so nobody "completes" the list later:
     #
