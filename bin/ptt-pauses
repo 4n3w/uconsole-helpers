@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""How short can bin/ptt's silence window safely be?
+
+    ptt-pauses [DIR]            replay a corpus against candidate windows
+    ptt-pauses -w 2.5,2,1.5 DIR only these candidates
+    ptt-pauses -v DIR           one line per recording
+
+Gather the corpus first, by dictating normally for a week with:
+
+    PTT_KEEP_WAV=~/ptt-corpus        (in ~/.config/uconsole/voice.conf)
+
+WHY THIS EXISTS. The window used to be the cheap half of dictation latency —
+whisper took ~13 s on this board and a 2 s pause was rounding error. A LAN
+whisper now answers a 5 s utterance in 0.36 s, so the window is roughly FIVE
+TIMES the transcription it precedes. It is the wait.
+
+But it cannot simply be lowered. 2 s was set against a single measured ~1.75 s
+mid-sentence pause, i.e. 0.25 s of margin, and the asymmetry is brutal: too long
+only makes you wait, too short truncates a clause — and on $mod+\ it does not
+truncate, it SUBMITS the truncated half. One number, measured once, is not
+enough evidence to move it in the dangerous direction.
+
+So this replays real recordings and answers the only question that decides it:
+**for each candidate window, how many of your own dictations would it have cut
+off, and how much time would it have saved?** "Leave it at 2 s" is a perfectly
+good answer and this is how you would know.
+
+IT IMPORTS THE WATCHER RATHER THAN REIMPLEMENTING IT. The block size, the
+decimation, the adaptive floor+margin threshold and the "has anything been said"
+dynamic-range test all live in ptt-silence-watch.py. A private copy here would
+answer a subtly different question and nothing would ever say so.
+
+THE TRAILING SILENCE IS AN ARTEFACT, and every kept recording has some: the
+auto-stop is what closed the file, so it ends with about one window of quiet.
+bin/ptt records the window in the filename (`-w2.wav`) precisely so that can be
+subtracted rather than mistaken for how you speak.
+"""
+
+import importlib.util
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+
+
+def _watcher():
+    path = os.path.join(HERE, "ptt-silence-watch.py")
+    spec = importlib.util.spec_from_file_location("ptt_silence_watch", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+W = _watcher()
+BLOCK_S = W.BLOCK_S
+DEFAULT_WINDOWS = [3.0, 2.5, 2.0, 1.5, 1.2, 1.0]
+MARGIN_DB = float(os.environ.get("PTT_SILENCE_MARGIN_DB", "12"))
+
+
+def recorded_window(path):
+    """The window this recording was made with, from its name. None if absent."""
+    m = re.search(r"-w([0-9.]+)\.wav$", os.path.basename(path))
+    return float(m.group(1)) if m else None
+
+
+def replay(levels, window):
+    """Where the watcher would have stopped, given per-block levels.
+
+    Mirrors the live loop: a trailing-window maximum, an adaptive threshold of
+    floor+margin, and no firing until dynamic range says something was said.
+    Returns the block index it stops at, or None if it never fires.
+
+    The live watcher polls on time (0.4 s) rather than per block, but it can only
+    ever act on whole blocks, so stepping block by block reaches the same
+    decisions one poll earlier at worst.
+    """
+    span = max(1, int(round(window / BLOCK_S)))
+    floor = peak = None
+    heard = False
+    for i, lvl in enumerate(levels):
+        if i + 1 < span:
+            continue                     # not a full window of audio yet
+        level = max(levels[i + 1 - span:i + 1])
+        floor = level if floor is None else min(floor, level)
+        peak = level if peak is None else max(peak, level)
+        if not heard and (peak - floor) > MARGIN_DB:
+            heard = True
+        if heard and level <= floor + MARGIN_DB:
+            return i
+    return None
+
+
+def speech_after(levels, idx, thresh):
+    """Was anything said after block `idx`? This is what "cut off" means."""
+    return any(l > thresh for l in levels[idx + 1:])
+
+
+def internal_pauses(levels, thresh):
+    """Lengths of quiet runs that have speech after them, in seconds.
+
+    Runs with nothing after them are the trailing silence, which is the artefact
+    of the window rather than a pause in what you said.
+    """
+    out, run = [], 0
+    for i, lvl in enumerate(levels):
+        if lvl <= thresh:
+            run += 1
+            continue
+        if run:
+            out.append(run * BLOCK_S)
+        run = 0
+    return out                            # a trailing run is deliberately dropped
+
+
+def pct(xs, p):
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return s[min(len(s) - 1, int(round((p / 100.0) * (len(s) - 1))))]
+
+
+def main(argv):
+    windows = DEFAULT_WINDOWS
+    verbose = False
+    args = []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "-w":
+            windows = [float(x) for x in argv[i + 1].split(",")]
+            i += 2
+        elif a in ("-v", "--verbose"):
+            verbose = True
+            i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__.rstrip())
+            return 0
+        else:
+            args.append(a)
+            i += 1
+
+    d = args[0] if args else os.environ.get(
+        "PTT_KEEP_WAV", os.path.expanduser("~/ptt-corpus"))
+    d = os.path.expanduser(d)
+    if not os.path.isdir(d):
+        sys.stderr.write(
+            "ptt-pauses: %s does not exist.\n"
+            "  Gather a corpus first: set PTT_KEEP_WAV=%s in\n"
+            "  ~/.config/uconsole/voice.conf and dictate normally for a week.\n"
+            % (d, d))
+        return 1
+
+    wavs = sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".wav"))
+    if not wavs:
+        sys.stderr.write("ptt-pauses: no .wav files in %s\n" % d)
+        return 1
+
+    all_pauses = []
+    # per candidate window: [cut count, saved seconds, never-fired count]
+    tally = dict((w, [0, [], 0]) for w in windows)
+    unlabelled = 0
+    analysed = 0
+
+    for path in wavs:
+        try:
+            levels = W.block_series(path)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("ptt-pauses: skipping %s (%s)\n" % (path, exc))
+            continue
+        if len(levels) < 4:
+            continue
+        analysed += 1
+
+        # The same adaptive threshold the watcher settles on over the whole file.
+        thresh = min(levels) + MARGIN_DB
+        all_pauses.extend(internal_pauses(levels, thresh))
+
+        actual = recorded_window(path)
+        if actual is None:
+            unlabelled += 1
+        # Where speech actually ended, so "saved" is measured against the audio
+        # rather than against the file length.
+        last_speech = max((i for i, l in enumerate(levels) if l > thresh),
+                          default=None)
+        if last_speech is None:
+            continue
+
+        for w in windows:
+            stop = replay(levels, w)
+            if stop is None:
+                tally[w][2] += 1
+                continue
+            if speech_after(levels, stop, thresh):
+                tally[w][0] += 1
+                if verbose:
+                    print("  CUT  %-40s w=%.1f at %.1fs, speech until %.1fs"
+                          % (os.path.basename(path), w, (stop + 1) * BLOCK_S,
+                             (last_speech + 1) * BLOCK_S))
+            else:
+                tally[w][1].append((stop - last_speech) * BLOCK_S)
+
+    print("ptt-pauses: %d recordings in %s" % (analysed, d))
+    if unlabelled:
+        print("  (%d have no -wN.wav suffix; their trailing silence is unknown)"
+              % unlabelled)
+    print()
+    print("  internal pauses      %d" % len(all_pauses))
+    if all_pauses:
+        print("  median               %.2f s" % pct(all_pauses, 50))
+        print("  95th percentile      %.2f s" % pct(all_pauses, 95))
+        print("  longest              %.2f s   <- the constraint" % max(all_pauses))
+    print()
+    print("  window   cut off   median wait after you stop")
+    unevaluable = False
+    for w in windows:
+        cuts, saved, never = tally[w]
+        wait = "%.2f s" % sorted(saved)[len(saved) // 2] if saved else "     —"
+        note = ""
+        if never:
+            note = "  (%d unevaluable)" % never
+            unevaluable = True
+        flag = "  <- current default" if abs(w - 2.0) < 1e-9 else ""
+        print("  %5.1fs   %5d     %s%s%s" % (w, cuts, wait, note, flag))
+    print()
+    print("  A cut is a recording where the window fired while there was still")
+    print("  speech to come. On $mod+\\ that does not truncate, it SUBMITS the")
+    print("  truncated half — so the target is zero, not a small number.")
+    if unevaluable:
+        print()
+        print("  Unevaluable means the recording ends before that window could")
+        print("  elapse — it was made with a SHORTER one, so its tail was cut at")
+        print("  the shorter length. A corpus can only test windows at or below")
+        print("  the setting it was gathered under. Raise PTT_SILENCE_SECS and")
+        print("  re-gather to evaluate longer ones.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

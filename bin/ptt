@@ -113,6 +113,26 @@ SILENCE_END_DBFS="${PTT_SILENCE_END_DBFS:-auto}"
 # dB above the quietest block seen, when auto.
 SILENCE_MARGIN_DB="${PTT_SILENCE_MARGIN_DB:-12}"
 
+# Keep a copy of each recording, for bin/ptt-pauses to replay against candidate
+# silence windows. OFF BY DEFAULT AND DELIBERATELY OPT-IN: this is your voice,
+# and a dictation tool that quietly retains everything it hears is a different
+# and much worse thing than one that does not. Set it, gather a week, delete the
+# directory. One switch, one place, nothing to clean up elsewhere.
+#
+# The numbers above were set against a SINGLE measured ~1.75s pause. That is thin
+# evidence for a threshold this box has already had to re-derive once, and now
+# that a LAN whisper answers in 0.36s the window IS the latency of dictation —
+# whatever it is set to, you wait that long before anything happens.
+KEEP_WAV="${PTT_KEEP_WAV:-}"
+# Expand a leading ~ by hand. voice.conf is SOURCED, so an unquoted ~/x expands
+# and a quoted "~/x" does not — and the quoted form would silently create a
+# directory literally named ~ in $HOME, which is the sort of mess that outlives
+# the experiment that caused it. See the voice.conf quoting gotcha in CLAUDE.md.
+case "$KEEP_WAV" in
+    "~")   KEEP_WAV="$HOME" ;;
+    "~/"*) KEEP_WAV="$HOME/${KEEP_WAV#\~/}" ;;
+esac
+
 SELF="$(readlink -f "$0")"
 WATCHER="$(dirname "$SELF")/ptt-silence-watch.py"
 
@@ -329,10 +349,7 @@ do_start() {
     local pid=$!
 
     printf '%s %s %s %s %s\n' "$pid" "$wav" "$started" "$enter" "$sink" >"$STATE"
-    local win="$SILENCE_SECS"
-    if [ "$enter" = "1" ] || [ "$sink" != "type" ]; then
-        win="$SILENCE_SECS_COMMIT"
-    fi
+    local win; win=$(silence_window "$enter" "$sink")
     log "start: pid=$pid wav=$wav enter=$enter sink=$sink win=${win}s"
 
     # Detached, and it shuts itself down when the state file stops naming this
@@ -342,6 +359,36 @@ do_start() {
             "$win" "$SILENCE_END_DBFS" "$LOG" "$SILENCE_MARGIN_DB" \
             >/dev/null 2>&1 &
     fi
+}
+
+# Which silence window a recording gets, decided by how it was started. ONE rule
+# with two callers — `start` spawns the watcher with it, `keep_wav` records it —
+# because a second copy of "committed paths get the longer window" is exactly the
+# sort of thing that gets updated in one place only.
+silence_window() {
+    local enter="$1" sink="$2"
+    if [ "$enter" = "1" ] || [ "$sink" != "type" ]; then
+        echo "$SILENCE_SECS_COMMIT"
+    else
+        echo "$SILENCE_SECS"
+    fi
+}
+
+# Copy a finished recording aside when PTT_KEEP_WAV is set. NEVER fails the
+# dictation: every error path here logs and returns 0, because a corpus for a
+# tuning exercise is not worth breaking the tool it is tuning.
+keep_wav() {
+    [ -n "$KEEP_WAV" ] || return 0
+    local wav="$1" win="$2" base
+    mkdir -p "$KEEP_WAV" 2>/dev/null || { log "keep: cannot create $KEEP_WAV"; return 0; }
+    # The window goes in the FILENAME because every kept recording ends with
+    # roughly that much silence — the auto-stop is what closed it. An analyser
+    # that did not know would read the setting being measured as if it were part
+    # of how you speak.
+    base=$(basename "${wav%.wav}")
+    cp "$wav" "$KEEP_WAV/$base-w$win.wav" 2>/dev/null \
+        || log "keep: could not copy into $KEEP_WAV"
+    return 0
 }
 
 do_stop() {
@@ -383,6 +430,12 @@ do_stop() {
 
     beep stop -bg
     log "stop: ${elapsed}ms captured, transcribing"
+
+    # Kept HERE and nowhere earlier, so the corpus holds only recordings that
+    # were real enough to transcribe — past MIN_MS, non-empty, mic demonstrably
+    # alive. Aborted and dead-mic captures would otherwise dominate it and
+    # measure nothing about how you speak.
+    keep_wav "$wav" "$(silence_window "$enter" "$sink")"
 
     local text
     text=$("$(dirname "$(readlink -f "$0")")/listen" -f "$wav" 2>>"$LOG")

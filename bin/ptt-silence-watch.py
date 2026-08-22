@@ -39,6 +39,11 @@ import time
 RATE, WIDTH, HDR = 16000, 2, 44
 POLL_S = 0.4
 
+# THE MEASUREMENT IS A 0.5s BLOCK, NEVER THE MEAN OF A WINDOW. See
+# peak_block() for why; it is the single most load-bearing decision in here.
+BLOCK_S = 0.5
+DECIMATE = 4        # every 4th sample. A level judgement needs no more.
+
 
 def data_offset(path, _cache={}):
     """Where the samples start in a wav still being written.
@@ -60,6 +65,80 @@ def data_offset(path, _cache={}):
         return HDR                      # header not written yet — do not cache
     _cache[path] = i + 8
     return i + 8
+
+
+def _samples(raw):
+    a = array.array("h")
+    a.frombytes(raw[: len(raw) // 2 * 2])
+    return a
+
+
+def blocks_dbfs(a):
+    """dBFS of each whole BLOCK_S block in `a`, in order.
+
+    Decimated within the block, which costs nothing in accuracy: `array` keeps
+    the decode in C and a level judgement does not need every sample.
+    """
+    block = int(RATE * BLOCK_S)
+    out = []
+    for start in range(0, len(a) - block + 1, block):
+        chunk = a[start:start + block][::DECIMATE]
+        if not chunk:
+            continue
+        acc = 0
+        for v in chunk:
+            acc += v * v
+        rms = math.sqrt(acc / len(chunk))
+        out.append(20 * math.log10(rms / 32768.0) if rms > 0 else -99.0)
+    return out
+
+
+def peak_block(path, secs):
+    """Loudest BLOCK_S block in the trailing `secs` of a wav still being written.
+
+    AVERAGING IS THE WRONG MEASURE HERE and this was caught in testing rather
+    than reasoned out: a 3 s window holding 0.9 s of speech and 2.1 s of quiet
+    AVERAGED -40.3 dBFS and tripped a -40.0 threshold, ending the recording while
+    the speaker was mid-sentence. Energy diluted across a window hides in a mean.
+
+    The loudest block asks the question actually being asked — "was anything said
+    at any point in the last N seconds?" — and restores real margin: a quiet block
+    reads about -45 dBFS here and one containing speech about -25, so the
+    threshold sits between two well-separated populations rather than on a
+    continuum.
+
+    Returns None until the file holds a full window, so a recording that has only
+    just started is never judged.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    want = int(RATE * secs) * WIDTH
+    if size - data_offset(path) < want:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(size - want)
+            raw = fh.read(want)
+    except OSError:
+        return None
+    levels = blocks_dbfs(_samples(raw))
+    return max(levels) if levels else None
+
+
+def block_series(path):
+    """Every BLOCK_S block in a COMPLETE wav, for offline analysis.
+
+    bin/ptt-pauses uses this to replay a recording against candidate silence
+    windows. It lives here rather than there so the replay measures what the
+    watcher actually does — an analyser with its own copy of the block size, the
+    decimation or the threshold rule would answer a subtly different question and
+    nothing would say so.
+    """
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    return blocks_dbfs(_samples(raw[data_offset(path):]))
 
 
 def main():
@@ -100,51 +179,6 @@ def main():
         except Exception:
             pass
 
-    def trailing_peak_block(secs):
-        """Loudest 0.5 s block in the trailing window, not its mean.
-
-        AVERAGING IS THE WRONG MEASURE HERE and this was caught in testing: a
-        3 s window holding 0.9 s of speech and 2.1 s of quiet averaged -40.3
-        dBFS and tripped a -40.0 threshold, ending the recording while the
-        speaker was still mid-sentence. Energy diluted over the window hides in
-        the mean.
-
-        Taking the loudest block instead asks the right question — "was anything
-        said at any point in the last N seconds?" — and restores real margin: a
-        quiet block reads about -45 dBFS here and one containing speech about
-        -25, so the threshold sits between two well-separated populations rather
-        than on a continuum.
-        """
-        try:
-            size = os.path.getsize(wav)
-        except OSError:
-            return None
-        want = int(RATE * secs) * WIDTH
-        if size - data_offset(wav) < want:
-            return None
-        try:
-            with open(wav, "rb") as fh:
-                fh.seek(size - want)
-                raw = fh.read(want)
-        except OSError:
-            return None
-        a = array.array("h")
-        a.frombytes(raw[: len(raw) // 2 * 2])
-        if not len(a):
-            return None
-        block = int(RATE * 0.5)
-        loudest = -99.0
-        for start in range(0, len(a) - block + 1, block):
-            chunk = a[start:start + block][::4]   # decimated within the block
-            acc = 0
-            for v in chunk:
-                acc += v * v
-            rms = math.sqrt(acc / len(chunk)) if chunk else 0.0
-            db = 20 * math.log10(rms / 32768.0) if rms > 0 else -99.0
-            if db > loudest:
-                loudest = db
-        return loudest
-
     def still_ours():
         try:
             with open(state) as fh:
@@ -183,7 +217,7 @@ def main():
     peak = None
     while still_ours():
         time.sleep(POLL_S)
-        level = trailing_peak_block(window)
+        level = peak_block(wav, window)
         if level is None:
             continue
         floor = level if floor is None else min(floor, level)
@@ -220,7 +254,7 @@ def wait_for_silence(wav, window, thresh_arg, margin):
     deadline = time.time() + 120
     while time.time() < deadline:
         time.sleep(POLL_S)
-        level = _peak(wav, window)
+        level = peak_block(wav, window)
         if level is None:
             continue
         floor = level if floor is None else min(floor, level)
@@ -239,44 +273,13 @@ def trace(wav, window, thresh):
     end = time.time() + 600
     while time.time() < end:
         time.sleep(1.0)
-        lvl = _peak(wav, window)
+        lvl = peak_block(wav, window)
         if lvl is None:
             continue
         verdict = "SILENT" if lvl <= thresh else "sound"
         bar = "#" * max(0, min(40, int((lvl + 60) / 1.2)))
         builtins.print("  %7.1f dBFS  %-6s %s" % (lvl, verdict, bar), flush=True)
     return 0
-
-
-def _peak(wav, secs):
-    RATE, WIDTH = 16000, 2
-    try:
-        size = os.path.getsize(wav)
-    except OSError:
-        return None
-    want = int(RATE * secs) * WIDTH
-    if size - data_offset(wav) < want:
-        return None
-    try:
-        with open(wav, "rb") as fh:
-            fh.seek(size - want)
-            raw = fh.read(want)
-    except OSError:
-        return None
-    a = array.array("h")
-    a.frombytes(raw[: len(raw) // 2 * 2])
-    block = int(RATE * 0.5)
-    loudest = -99.0
-    for st in range(0, len(a) - block + 1, block):
-        c = a[st:st + block][::4]
-        acc = 0
-        for v in c:
-            acc += v * v
-        r = math.sqrt(acc / len(c)) if c else 0.0
-        db = 20 * math.log10(r / 32768.0) if r > 0 else -99.0
-        if db > loudest:
-            loudest = db
-    return loudest
 
 
 if __name__ == "__main__":

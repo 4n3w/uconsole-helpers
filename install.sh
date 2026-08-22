@@ -170,6 +170,7 @@ do_links() {
     # not on PATH.
     link "$HOME/uconsole/bin/mic-probe"         "$HOME/.local/bin/mic-probe"
     link "$HOME/uconsole/bin/power-probe"       "$HOME/.local/bin/power-probe"
+    link "$HOME/uconsole/bin/ptt-pauses"        "$HOME/.local/bin/ptt-pauses"
 
     # DELIBERATELY NOT LINKED, so nobody "completes" the list later:
     #

@@ -263,6 +263,7 @@ Nothing outstanding. `tty/rose-pine-tty.sh` was **confirmed painting on a real V
 | `bin/converse` | spoken conversation with a LAN chat model. `-q` no speaker, `-t` typed input, `-qt` both. Runs on the Mac too |
 | `bin/mic-probe` | per-channel levels off a capture device, and which channel the mic is actually on. The tool to reach for when capture is broken |
 | `bin/power-probe` | median current draw over N seconds. **Refuses to run on AC**, where the number is meaningless. `-q` prints just the mA, for scripting |
+| `bin/ptt-pauses` | replays a corpus of kept dictations against candidate silence windows, and reports how many each would have cut off |
 
 **Everything a human types is symlinked into `~/.local/bin` by `install.sh`.** Three files
 are deliberately not: `battery-remaining`, because starship invokes it by absolute path
@@ -1288,6 +1289,51 @@ them. `bin/ptt-silence-watch.py` is spawned detached by `start`, polls the
 growing wav, and runs `ptt stop` when it falls quiet. It exits on its own once the state
 file stops naming that recording, so a manual toggle, a cancel or an orphan recovery all
 end it without its pid being tracked. `PTT_SILENCE_SECS=0` restores pure toggling.
+
+#### The window is now the whole latency, and 1.75 s was one measurement
+
+**This is the open question on dictation, and it inverted without anything being
+re-tuned.** When these windows were set, whisper took ~13 s on this board and a 2 s pause
+was rounding error. A LAN whisper answers a 5 s utterance in **0.36 s** — so the window is
+roughly *five times* the transcription that follows it. Whatever it is set to is what you
+wait. Every past optimisation here aimed at the other half.
+
+It cannot simply be lowered. The 2 s came from a **single** measured ~1.75 s pause, and
+this box has already had to re-derive a threshold once when the evidence turned out to be
+too thin (see the `tiny.en` reversal and the −40.0 dBFS knife edge). Moving a number in the
+dangerous direction on one observation is how both of those happened.
+
+So measure first. `PTT_KEEP_WAV=<dir>` makes `bin/ptt` copy each finished recording aside;
+dictate normally for a week, then:
+
+```bash
+ptt-pauses ~/ptt-corpus
+```
+
+It replays the corpus against candidate windows and reports, for each, **how many of your
+own dictations it would have cut off mid-sentence** and how long you would have waited. The
+target for cuts is **zero**, not a small number — on `$mod+\` a cut does not truncate, it
+submits the truncated half. **"Leave it at 2 s" is a perfectly good outcome**, and the
+point is to know rather than guess.
+
+Three properties worth not re-deriving:
+
+- **Retention is opt-in and off by default.** A dictation tool that quietly keeps
+  everything it hears is a different and much worse thing than one that does not. One
+  variable, one directory, delete it when done.
+- **`ptt-pauses` imports `ptt-silence-watch.py` rather than reimplementing it.** The block
+  size, the decimation, the adaptive floor+margin and the dynamic-range "has anything been
+  said" test all live in the watcher. A private copy in the analyser would answer a subtly
+  different question and nothing would ever say so.
+- **A corpus can only test windows at or below the setting it was gathered under.** Every
+  kept recording ends with about one window of silence, because the auto-stop is what
+  closed the file — so `ptt` records the window in the filename and the analyser reports
+  longer candidates as *unevaluable* rather than as zero cuts.
+
+**Not doing: speculative transcription.** Starting the POST at the first quiet block and
+cancelling if you resume would hide the window almost entirely. It is real complexity for a
+second or so, and worth nothing until the measurement says the window cannot come down on
+its own.
 
 It reads **raw bytes from a fixed 44-byte offset** rather than using python's `wave`
 module: arecord only finalises the header's frame count on close, so `wave` cannot read a
