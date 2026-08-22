@@ -148,10 +148,34 @@ do_links() {
     # NOTE ~/.config/sway must stay a REAL directory: config.d/ has to be local so
     # this repo's override can be dropped into it alongside the dotfiles base.
     link "$HOME/uconsole/sway/10-uconsole.conf" "$HOME/.config/sway/config.d/10-uconsole.conf"
+
+    # EVERY bin/ script a HUMAN types. This list drifted for a while — it had four
+    # entries while the device had nine, and --check reported ok because it did not
+    # know the other five existed. That is the one failure this script is supposed
+    # to be immune to, so keep it complete.
+    #
+    # Nothing in sway breaks when one is missing: every bindsym calls
+    # ~/uconsole/bin/... by absolute path. So the symptom is only ever "command not
+    # found" at a prompt, which is exactly why the gap survived unnoticed.
     link "$HOME/uconsole/bin/wifi"              "$HOME/.local/bin/wifi"
     link "$HOME/uconsole/bin/ptt"               "$HOME/.local/bin/ptt"
     link "$HOME/uconsole/bin/note"              "$HOME/.local/bin/note"
     link "$HOME/uconsole/bin/converse"          "$HOME/.local/bin/converse"
+    link "$HOME/uconsole/bin/say"               "$HOME/.local/bin/say"
+    link "$HOME/uconsole/bin/listen"            "$HOME/.local/bin/listen"
+    link "$HOME/uconsole/bin/audio"             "$HOME/.local/bin/audio"
+    link "$HOME/uconsole/bin/backlight"         "$HOME/.local/bin/backlight"
+    # mic-probe is a diagnostic, and the one you reach for when capture is broken —
+    # i.e. the worst possible time to discover it is not on PATH.
+    link "$HOME/uconsole/bin/mic-probe"         "$HOME/.local/bin/mic-probe"
+
+    # DELIBERATELY NOT LINKED, so nobody "completes" the list later:
+    #
+    #   battery-remaining     starship invokes it by absolute path, from the OTHER
+    #                         repo. Linking it is harmless but buys nothing, and
+    #                         CLAUDE.md documents it as absent.
+    #   ptt-silence-watch.py  called by their siblings by path, never by a human.
+    #   note-triage.py        Putting them on PATH implies an interface they lack.
 
     section "~/.profile hooks"
     # Order matters: the palette first, sway second — the palette is what you are

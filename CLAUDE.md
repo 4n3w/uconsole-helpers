@@ -260,12 +260,23 @@ Nothing outstanding. `tty/rose-pine-tty.sh` was **confirmed painting on a real V
 | `bin/audio` | `status`/`out`/`in`/`vol`/`mute`/`mic`/`test`/`level` for PulseAudio and ALSA, plus an fzf menu with no args |
 | `bin/note` | spoken notebook. `add`/`today`/`search`/`read`/`edit`/`sync`. Bound to `$mod+n`; notes live in `~/notes`, outside this repo |
 | `bin/ptt` | dictation. `toggle [--enter]`/`start`/`stop`/`cancel`/`status`. Bound in `10-uconsole.conf` to `$mod+/` (toggle) and `$mod+\` (toggle, then Return); types the transcript into the focused window |
+| `bin/converse` | spoken conversation with a LAN chat model. `-q` no speaker, `-t` typed input, `-qt` both. Runs on the Mac too |
+| `bin/mic-probe` | per-channel levels off a capture device, and which channel the mic is actually on. The tool to reach for when capture is broken |
 
-`wifi` and `ptt` are symlinked into `~/.local/bin`. `battery-remaining` is **not** on
-`PATH` — starship invokes it by absolute path, so nothing noticed. Symlink it too if you
-want it by hand.
+**Everything a human types is symlinked into `~/.local/bin` by `install.sh`.** Three files
+are deliberately not: `battery-remaining`, because starship invokes it by absolute path
+from the *other* repo; and `ptt-silence-watch.py` and `note-triage.py`, which their
+siblings call by path and which have no interface a person would use.
 
-Both are 64-bit-arithmetic and `sudo`-dependent respectively; see each script's header.
+That list drifted badly and is worth remembering as a *shape* of bug. `install.sh` linked
+four while the device had nine, and `--check` reported everything ok, because a check can
+only find what it was told to look for. Nothing broke, either — every sway `bindsym` calls
+`~/uconsole/bin/...` by absolute path, so the only symptom available was "command not
+found" at a prompt on a machine nobody had rebuilt yet. **A missing entry in a completeness
+check is invisible by construction**; only comparing it against reality finds it.
+
+`battery-remaining` is 64-bit-arithmetic and `wifi` is `sudo`-dependent; see each script's
+header.
 
 ### `tty/` — hooked from `~/.profile`
 
