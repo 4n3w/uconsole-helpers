@@ -700,8 +700,29 @@ login. An explicit environment variable still overrides it.
 
 Server side lives in `~/workspace/uconsole-voice` on the Mac — a self-contained CMake, a
 whisper.cpp build with Metal, the model, and `serve.sh start|stop|status`. Nothing was
-installed system-wide. It is started by hand and **will not survive a reboot**; a launchd
-agent would fix that and was deliberately not added without asking.
+installed system-wide.
+
+**`serve.sh install-agent` makes it survive a reboot**, added 2026-08-21. It was
+hand-started before that, and the reason to fix it is the *shape* of the failure rather
+than its severity: the client falls back to local whisper, so nothing errors, nothing
+beeps, and dictation simply becomes 25 s instead of 0.36 s and starts returning "coral
+mass ejection". An invisible, gradual regression gets blamed on the microphone weeks
+later. An outage would have been better.
+
+Three things about it are worth not re-deriving, all in `server/README.md` at length:
+
+- **A LaunchAgent, not a LaunchDaemon.** A daemon starts at boot with nobody logged in,
+  which is what you want, but runs as root outside a GUI session — and Metal is the whole
+  reason `large-v3-turbo` is fast. So it comes up at **login**, and a Mac parked at the
+  login window has no servers.
+- **`KeepAlive` is `SuccessfulExit: false`.** Plain `true` restarts after any exit,
+  including the clean one `stop` asks for, so the server looks impossible to stop.
+- **The plists are generated from `serve.sh`, not committed.** `$HOME` differs per
+  machine, and a checked-in copy would drift from the flags silently, both files looking
+  correct on their own.
+
+`serve.sh` also drives `launchctl` rather than `nohup`/`pkill` once an agent exists — two
+managers for one process means `pkill` and launchd fight, and launchd wins.
 
 **Wifi power save is disabled by `wifi on`, and it matters more than it sounds.** Twelve
 identical transcription requests each way:

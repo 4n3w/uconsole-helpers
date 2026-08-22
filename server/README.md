@@ -39,8 +39,62 @@ confirmation.
 the machine it runs on, which looks identical from that machine and fails from
 everywhere else. It also means anything on the LAN can reach it.
 
-**It does not survive a reboot.** `serve.sh` uses `nohup`; a launchd agent or
-systemd unit would fix that and is deliberately left to whoever runs it.
+**It does not survive a reboot until you make it.** See below — and note that the
+failure is silent, which is what makes it worth doing.
+
+## Surviving a reboot — `./serve.sh install-agent`
+
+```bash
+./serve.sh install-agent      # both services
+./serve.sh status             # says which manager is in charge
+./serve.sh uninstall-agent    # back to hand-started
+```
+
+**Why bother, when the client falls back?** Because the fallback is the problem.
+Nothing announces a server that did not come back: the uConsole keeps transcribing,
+quietly at 25 s instead of 0.36 s and with worse words — `coral mass ejection` for
+`coronal mass ejection`. A regression that is invisible, gradual, and gets blamed
+on the microphone weeks later is worse than an outage, which at least tells you the
+moment it happened.
+
+**A LaunchAgent, not a LaunchDaemon, and the difference costs you something.** A
+daemon in `/Library/LaunchDaemons` starts at boot with nobody logged in, which
+sounds like what you want. It also runs as root outside any GUI session, and Metal
+is the entire reason `large-v3-turbo` answers in a third of a second. So this is an
+agent in `~/Library/LaunchAgents`, and **it comes up at login rather than at boot**
+— a Mac sitting at the login window has no servers. Enable automatic login, or stay
+logged in. There is no third option that keeps the GPU.
+
+**The plists are generated, not committed.** `$HOME` differs per machine, so a
+checked-in plist would be wrong everywhere but the machine it was written on. More
+importantly, the flags live in `serve.sh` exactly once and the plist is built from
+them — a committed copy would drift the moment a flag changed, and drift silently,
+since both files would still look correct on their own. `install-agent` is
+therefore also how you apply a flag change.
+
+**`KeepAlive` is `SuccessfulExit: false`, not `true`.** Plain `true` restarts the
+job after *any* exit, including the clean one `serve.sh stop` asks for — so the
+server appears impossible to stop. This is a bad afternoon; the setting avoids it.
+
+For the same reason `serve.sh` drives `launchctl` once an agent exists, rather than
+`nohup` and `pkill`. Two managers for one process means `pkill` and launchd fight,
+and launchd wins.
+
+On anything that is not a Mac, `install-agent` refuses and points at systemd. The
+hand-started path is unchanged and still works everywhere.
+
+### Checking it actually worked
+
+```bash
+launchctl print gui/$(id -u)/local.uconsole-voice.whisper | head -20
+```
+
+Then reboot, log in, and ask **from the uConsole** rather than from the Mac —
+`--host 0.0.0.0` is the setting that makes those two different answers:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' http://<mac>:8178/
+```
 
 ## The client side is NOT here
 
