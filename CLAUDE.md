@@ -55,7 +55,7 @@ whisper.cpp + models) and the root-owned system changes.
 **`--check` is the load-bearing mode.** It changes nothing, so it is safe on a working
 box, and it is what keeps this documentation honest: prose drifts silently, but a script
 that has drifted fails visibly the next time anyone runs it. On a fully-installed device
-it reports 35 items ok and exits 0.
+it reports 44 items ok and exits 0.
 
 Four safety properties, each verified against a throwaway `HOME` rather than assumed:
 
