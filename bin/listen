@@ -193,6 +193,31 @@ print(max(256, ctx))
 PY
 }
 
+### Fix WAV header after a killed recording.
+#
+# sox and rec pre-write the header with placeholder sizes (~2 GB) and update them
+# on clean exit. A killed recording (the -s and Enter paths) keeps the placeholders,
+# producing a valid-looking WAV whose header says the data is 2 GB. Most tools
+# read to EOF and cope, but whisper-server sometimes hangs trying to honour the
+# declared size. Fix it from the actual file size.
+fix_wav_header() {
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" <<'FIXWAV' 2>/dev/null || true
+import struct, sys, os
+p = sys.argv[1]
+sz = os.path.getsize(p)
+if sz < 44:
+    sys.exit(0)
+with open(p, "r+b") as f:
+    f.seek(4); f.write(struct.pack("<I", sz - 8))
+    # Find the data chunk — don't assume offset 40
+    f.seek(0); hdr = f.read(min(sz, 4096))
+    i = hdr.find(b"data", 12)
+    if i != -1:
+        f.seek(i + 4); f.write(struct.pack("<I", sz - i - 8))
+FIXWAV
+}
+
 ### Is the capture device actually producing anything?
 #
 # A dead input does not announce itself: it records a file of exactly the right
@@ -327,22 +352,24 @@ else
         # Same detection bin/ptt uses, via the same helper — a second
         # implementation of "have they stopped talking" would drift from it.
         printf '  listening — speak, then stop\n' >&2
-        record_wav "$wav" 120 &
+        record_wav "$wav" 120 >/dev/null &
         rec_pid=$!
         python3 "$(dirname "$(readlink -f "$0")")/ptt-silence-watch.py" --wait "$wav" \
             "${LISTEN_SILENCE_SECS:-2}" "${PTT_SILENCE_END_DBFS:-auto}" \
             "${PTT_SILENCE_MARGIN_DB:-12}" 2>/dev/null
         kill "$rec_pid" 2>/dev/null; wait "$rec_pid" 2>/dev/null
+        fix_wav_header "$wav"
     elif [ -n "$duration" ]; then
         printf '  recording %ss — speak now\n' "$duration" >&2
         record_wav "$wav" "$duration"
     else
         printf '  recording — press Enter to stop\n' >&2
-        record_wav "$wav" "" &
+        record_wav "$wav" "" >/dev/null &
         rec_pid=$!
         read -r _ </dev/tty 2>/dev/null || true
         kill "$rec_pid" 2>/dev/null
         wait "$rec_pid" 2>/dev/null
+        fix_wav_header "$wav"
     fi
 
     [ -s "$wav" ] || die "listen: nothing was recorded"
